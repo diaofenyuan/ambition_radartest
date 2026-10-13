@@ -304,7 +304,11 @@ function buildRules(rules) {
 }
 
 function highlightRules(s) {
-  const active = new Set([`${s.team}|info`, `${s.team}|jammer_${s.jammer.level}`]);
+  // "生效"以实际发射状态为准：卡片静态构建，只有正在发射的波源才挂高亮+“生效中”。
+  // 若仅按阵营/等级高亮，停止信息波后下方卡片仍显示"生效中"，与"已停止"自相矛盾。
+  const active = new Set();
+  if (s.info.running) active.add(`${s.team}|info`);
+  if (s.jammer.running) active.add(`${s.team}|jammer_${s.jammer.level}`);
   for (const el of $("waveGrid").children) {
     el.classList.toggle("active", active.has(`${el.dataset.team}|${el.dataset.wave}`));
   }
@@ -384,9 +388,13 @@ function render(s) {
   $("infoLoopback").innerHTML = fmtLoopback(s.info.loopback);
   $("jamLoopback").innerHTML = fmtLoopback(s.jammer.loopback);
 
-  // 生效波源与规则核对状态
+  // 生效波源与规则核对状态：徽标与下方卡片同口径，只列正在发射的波源，
+  // 否则停发后会出现"生效波源含广播源"与卡片已停止的矛盾
   const teamName = s.team === "red" ? "红方" : "蓝方";
-  $("srcBadge").textContent = `生效波源 ${teamName}·广播源 + ${teamName}·${{ 1: "一级", 2: "二级", 3: "三级" }[s.jammer.level]}干扰源`;
+  const onAir = [];
+  if (s.info.running) onAir.push(`${teamName}·广播源`);
+  if (s.jammer.running) onAir.push(`${teamName}·${{ 1: "一级", 2: "二级", 3: "三级" }[s.jammer.level]}干扰源`);
+  $("srcBadge").textContent = `生效波源 ${onAir.length ? onAir.join(" + ") : "无（未发射）"}`;
   $("srcBadge").className = "badge " + (s.team === "red" ? "red" : "blue");
   const bad = checkCompliance(s);
   $("ruleBadge").textContent = bad.length ? "规则核对 偏差: " + bad.join("、") : "规则核对 通过（表 5-23）";
