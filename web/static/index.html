@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>雷达无线电自测模拟发射系统</title>
+<style>
+  :root {
+    --bg: #10141a; --panel: #1a2028; --panel2: #212a34; --line: #2c3742;
+    --text: #dce4ec; --muted: #8b98a5; --accent: #4c8dff; --ok: #37c978;
+    --warn: #e8b339; --danger: #e8544c; --red: #e8544c; --blue: #4c8dff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font-family: "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 13px; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 18px;
+           background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  h1 { font-size: 16px; margin: 0 6px 0 0; font-weight: 600; }
+  .badge { padding: 3px 10px; border-radius: 10px; background: var(--panel2);
+           border: 1px solid var(--line); color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .badge.red { color: var(--red); border-color: var(--red); }
+  .badge.blue { color: var(--blue); border-color: var(--blue); }
+  .badge.ok { color: var(--ok); border-color: var(--ok); }
+  .badge.warn { color: var(--warn); border-color: var(--warn); }
+  .spacer { flex: 1; }
+  button { cursor: pointer; border: 1px solid var(--line); background: var(--panel2);
+           color: var(--text); padding: 6px 14px; border-radius: 6px; font-size: 13px; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { background: var(--danger); border-color: var(--danger); color: #fff; font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  select, input[type=text] { background: var(--panel2); color: var(--text);
+           border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font-size: 13px; }
+  input[type=text].hex { font-family: Consolas, monospace; width: 100%; }
+  label.chk { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  main { display: grid; grid-template-columns: minmax(330px, 1.2fr) minmax(330px, 1.05fr) minmax(300px, 0.9fr);
+         gap: 12px; padding: 12px 18px 0; align-items: start; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 12px 14px; margin-bottom: 12px; }
+  .card h2 { font-size: 14px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+  .row { display: flex; align-items: center; gap: 10px; margin: 6px 0; flex-wrap: wrap; }
+  .kv { display: flex; justify-content: space-between; padding: 3px 0; gap: 12px;
+        border-bottom: 1px dashed var(--line); }
+  .kv span:first-child { color: var(--muted); }
+  .kv span:last-child { text-align: right; font-variant-numeric: tabular-nums; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .dot.err { background: var(--danger); box-shadow: 0 0 6px var(--danger); }
+  .cmd { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+         padding: 8px 10px; margin: 8px 0; }
+  .cmd .title { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .cmd code { color: var(--warn); }
+  .logbox { height: 240px; overflow-y: auto; background: #0c1015; border: 1px solid var(--line);
+            border-radius: 8px; padding: 8px; font-family: Consolas, monospace; font-size: 12px; }
+  .logbox div { padding: 1px 0; color: var(--muted); white-space: pre-wrap; word-break: break-all; }
+  .tag { padding: 2px 8px; border-radius: 8px; font-size: 11px; background: var(--panel2); }
+  .tag.ok { color: var(--ok); border: 1px solid var(--ok); }
+  .tag.err { color: var(--danger); border: 1px solid var(--danger); }
+  .tag.warn { color: var(--warn); border: 1px solid var(--warn); }
+  input[type=range] { width: 140px; }
+  .foot { color: var(--muted); font-size: 11px; padding: 4px 18px 14px; line-height: 1.7; }
+
+  /* 无线电规则核对带 */
+  .rulesband { margin: 0 18px 4px; }
+  .rulesband .meta { display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--muted);
+                     font-size: 11px; margin-bottom: 10px; }
+  .rulesband .meta b { color: var(--text); font-weight: 600; }
+  .rulesband .meta code { color: var(--warn); font-family: Consolas, monospace; }
+  .wavegrid { display: grid; grid-template-columns: repeat(4, minmax(180px, 1fr)); gap: 10px; }
+  @media (max-width: 1180px) { .wavegrid { grid-template-columns: repeat(2, minmax(150px, 1fr)); } }
+  .src { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+         padding: 8px 10px; transition: border-color .15s, box-shadow .15s; }
+  .src.active { border-color: var(--ok); box-shadow: inset 0 0 0 1px var(--ok); }
+  .src .name { font-size: 12px; color: var(--muted); display: flex; align-items: center;
+               justify-content: space-between; gap: 6px; }
+  .src.active .name { color: var(--ok); font-weight: 600; }
+  .src .freq { font-size: 16px; font-weight: 600; margin: 3px 0 1px;
+               font-variant-numeric: tabular-nums; }
+  .src .spec { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .src .on { font-size: 10px; padding: 1px 6px; border-radius: 8px;
+             border: 1px solid var(--ok); color: var(--ok); visibility: hidden; }
+  .src.active .on { visibility: visible; }
+</style>
+</head>
+<body>
+<header>
+  <h1>雷达无线电自测模拟发射系统</h1>
+  <span class="badge" id="seasonBadge">赛季 --</span>
+  <span class="badge" id="modeBadge">模式 --</span>
+  <span class="badge" id="srcBadge">生效波源 --</span>
+  <span class="badge" id="ruleBadge">规则核对 --</span>
+  <span class="badge" id="linkBadge">链路 --</span>
+  <select id="teamSel">
+    <option value="red">红方</option>
+    <option value="blue">蓝方</option>
+  </select>
+  <label class="chk"><input type="checkbox" id="safetyChk"> 射频安全确认（勾选后才允许发射）</label>
+  <label class="chk"><input type="checkbox" id="autoVaryChk" checked> 数据自动变化</label>
+  <div class="spacer"></div>
+  <button class="danger" id="muteBtn">全局静音 MUTE</button>
+</header>
+
+<main>
+  <!-- 左：信息波发射 -->
+  <section>
+    <div class="card">
+      <h2><span class="dot" id="infoDot"></span>信息波发射（Pluto #1）
+        <span class="tag" id="infoRunTag">已停止</span></h2>
+      <div class="kv"><span>频点 / 带宽 / 规则功率</span><span id="infoRf">--</span></div>
+      <div class="kv"><span>发射衰减</span>
+        <span><input type="range" id="infoAtt" min="0" max="89" value="40"> <b id="infoAttVal">40</b> dB</span></div>
+      <div class="row">
+        <button class="primary" id="infoStartBtn">开始发射</button>
+        <button id="infoStopBtn">停止</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>信息波业务命令（0x0A01 ~ 0x0A05）</h2>
+      <div id="cmdList"></div>
+    </div>
+  </section>
+
+  <!-- 中：干扰波发射 -->
+  <section>
+    <div class="card">
+      <h2><span class="dot" id="jamDot"></span>干扰波发射（Pluto #2）
+        <span class="tag" id="jamRunTag">已停止</span></h2>
+      <div class="kv"><span>频点 / 带宽 / 规则功率</span><span id="jamRf">--</span></div>
+      <div class="kv"><span>发射衰减</span>
+        <span><input type="range" id="jamAtt" min="0" max="89" value="40"> <b id="jamAttVal">40</b> dB</span></div>
+      <div class="row">
+        <label>干扰等级
+          <select id="levelSel">
+            <option value="1">一级</option>
+            <option value="2">二级</option>
+            <option value="3">三级</option>
+          </select>
+        </label>
+        <label>密钥（6 位 ASCII）
+          <input type="text" id="keyInput" maxlength="6" style="width:90px">
+        </label>
+        <button id="keyRandBtn">随机</button>
+        <button class="primary" id="jamApplyBtn">应用切换</button>
+      </div>
+      <div class="row">
+        <button class="primary" id="jamStartBtn">开始发射</button>
+        <button id="jamStopBtn">停止</button>
+      </div>
+      <div class="foot">干扰等级选中即时生效；修改密钥后点「应用切换」提交。均支持发射中热切换，无需停发。</div>
+    </div>
+    <div class="card">
+      <h2>自检说明</h2>
+      <div class="foot">
+        · sim 模式：每周期发射波形经内部回环解码自检，右栏显示解出的业务命令。<br>
+        · pluto 模式：请确认两块板已接入不同子网（192.168.2.1 / 192.168.3.1），<br>
+        &nbsp;&nbsp;默认大衰减 + 假负载/短天线起步，功率按规则标称值另行校准。<br>
+        · 发射中可随时编辑业务数据、开关命令包，关闭的包位由随机字节填充。
+      </div>
+    </div>
+  </section>
+
+  <!-- 右：诊断 -->
+  <section>
+    <div class="card">
+      <h2>供样与链路诊断</h2>
+      <div class="kv"><span>信息波供样余量</span><span id="infoMargin">--</span></div>
+      <div class="kv"><span>信息波欠采计数 U</span><span id="infoU">0</span></div>
+      <div class="kv"><span>信息波已发采样</span><span id="infoSamples">0</span></div>
+      <div class="kv"><span>干扰波供样余量</span><span id="jamMargin">--</span></div>
+      <div class="kv"><span>干扰波欠采计数 U</span><span id="jamU">0</span></div>
+      <div class="kv"><span>干扰波已发采样</span><span id="jamSamples">0</span></div>
+    </div>
+    <div class="card">
+      <h2>回环自检（sim）</h2>
+      <div class="kv"><span>信息波</span><span id="infoLoopback">--</span></div>
+      <div class="kv"><span>干扰波</span><span id="jamLoopback">--</span></div>
+    </div>
+    <div class="card">
+      <h2>运行日志</h2>
+      <div class="logbox" id="logBox"></div>
+    </div>
+  </section>
+</main>
+
+<!-- 无线电规则核对带：与规则手册 V2.2.0 表 5-23 逐项对照 -->
+<section class="rulesband">
+  <div class="card">
+    <h2>无线电规则核对 <span class="tag" id="rulesSrcTag">规则手册 V2.2.0</span></h2>
+    <div class="meta" id="rulesMeta"></div>
+    <div class="wavegrid" id="waveGrid"></div>
+  </div>
+</section>
+
+<div class="foot">雷达无线电自测模拟发射系统 · 规则参数见 config/rf_profiles_2026.yaml · 测试环境请接假负载或短天线</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let state = null;
+
+function fmtFreq(hz) { return (hz / 1e6).toFixed(3) + " MHz"; }
+function fmtBw(hz) { return (hz / 1e3).toFixed(0) + " kHz"; }
+function fmtDbm(v) { return (v > 0 ? "+" : "") + v + " dBm"; }
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function fmtLoopback(lb) {
+  if (!lb || lb.ok === undefined) return "--";
+  if (!lb.ok) return '<span class="tag err">失败: ' + esc(lb.error || "") + '</span>';
+  return '<span class="tag ok">OK</span> 空口包 ' + lb.air_payloads + " / 帧 " + lb.frames +
+         ' <span class="tag">' + esc((lb.cmd_ids || []).join(" ")) + '</span>';
+}
+
+async function api(path, method = "GET", body = null) {
+  const opt = { method, headers: { "Content-Type": "application/json" } };
+  if (body) opt.body = JSON.stringify(body);
+  const res = await fetch(path, opt);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    // 400 的 detail 是字符串；422（pydantic 校验失败）的 detail 是对象数组，
+    // 直接拼接会显示成 "[object Object]"，需要分别取 msg 再拼
+    const detail = Array.isArray(data.detail)
+      ? data.detail.map(d => d.msg || JSON.stringify(d)).join("; ")
+      : data.detail;
+    alert("操作失败：" + (detail || res.status));
+  }
+  return res;
+}
+
+// ---- 业务命令列表：仅在首次构建 DOM，后续按字段增量刷新 ----
+// 若每 0.5s 重建 DOM，正在编辑的输入框会被覆盖、焦点丢失，因此必须增量更新。
+const cmdRefs = new Map();
+let cmdOrder = "";
+
+function buildCommands(cmds) {
+  const box = $("cmdList");
+  box.innerHTML = "";
+  cmdRefs.clear();
+  for (const c of cmds) {
+    const div = document.createElement("div");
+    div.className = "cmd";
+    div.innerHTML = `
+      <div class="title">
+        <label class="chk"><input type="checkbox" data-act="enable"></label>
+        <code>${esc(c.cmd_id)}</code> <span>${esc(c.name)}</span>
+        <span class="tag" data-role="mode"></span>
+      </div>
+      <div class="row">
+        <input type="text" class="hex" data-act="payload" spellcheck="false">
+        <button data-act="random">随机</button>
+      </div>`;
+    const en = div.querySelector("[data-act=enable]");
+    const py = div.querySelector("[data-act=payload]");
+    const rnd = div.querySelector("[data-act=random]");
+    en.onchange = () => api(`/api/command/${c.cmd_id}`, "POST", { enabled: en.checked });
+    rnd.onclick = () => api(`/api/command/${c.cmd_id}/random`, "POST");
+    py.onchange = () => api(`/api/command/${c.cmd_id}`, "POST", { payload_hex: py.value.trim() });
+    cmdRefs.set(c.cmd_id, { en, py, mode: div.querySelector("[data-role=mode]") });
+    box.appendChild(div);
+  }
+}
+
+function renderCommands(cmds) {
+  const order = cmds.map(c => c.cmd_id).join(",");
+  if (order !== cmdOrder) { buildCommands(cmds); cmdOrder = order; }
+  for (const c of cmds) {
+    const ref = cmdRefs.get(c.cmd_id);
+    if (!ref) continue;
+    if (ref.en.checked !== c.enabled) ref.en.checked = c.enabled;
+    // 输入框正在编辑时不覆盖，避免打断用户；失焦后再与服务端值同步
+    if (document.activeElement !== ref.py && ref.py.value !== c.payload_hex) ref.py.value = c.payload_hex;
+    const mode = c.auto_vary ? "自动变化" : "手动锁定";
+    if (ref.mode.textContent !== mode) {
+      ref.mode.textContent = mode;
+      ref.mode.className = "tag" + (c.auto_vary ? " ok" : "");
+    }
+  }
+}
+
+// ---- 规则核对面板：波源卡片静态构建一次，仅切换"生效"高亮 ----
+function buildRules(rules) {
+  $("rulesSrcTag").textContent = rules.source;
+  $("rulesMeta").innerHTML =
+    `<span>调制 <b>${esc(rules.modulation)}</b></span>` +
+    `<span>信息波 Access Code <code>${esc(rules.access_code_info)}</code></span>` +
+    `<span>干扰波 Access Code <code>${esc(rules.access_code_interfere)}</code></span>` +
+    `<span>信息波速率 <b>${esc(rules.info_rate)}</b></span>` +
+    `<span>干扰波速率 <b>${esc(rules.jammer_rate)}</b></span>`;
+  const grid = $("waveGrid");
+  grid.innerHTML = "";
+  for (const p of rules.profiles) {
+    const d = document.createElement("div");
+    d.className = "src";
+    d.dataset.team = p.team;
+    d.dataset.wave = p.wave;
+    d.innerHTML = `
+      <div class="name"><span>${esc(p.label)}</span><span class="on">生效中</span></div>
+      <div class="freq">${fmtFreq(p.freq_hz)}</div>
+      <div class="spec">带宽 ${esc((p.bandwidth_hz / 1e6).toFixed(2))} MHz · 功率 ${fmtDbm(p.power_dbm)}</div>
+      <div class="spec">Sensitivity ${p.sensitivity} rad/sample</div>`;
+    grid.appendChild(d);
+  }
+}
+
+function highlightRules(s) {
+  const active = new Set([`${s.team}|info`, `${s.team}|jammer_${s.jammer.level}`]);
+  for (const el of $("waveGrid").children) {
+    el.classList.toggle("active", active.has(`${el.dataset.team}|${el.dataset.wave}`));
+  }
+}
+
+// ---- 规则一致性核对：当前发射参数必须与表 5-23 对应波源完全一致 ----
+function checkCompliance(s) {
+  const want = {
+    info: s.rules.profiles.find(p => p.team === s.team && p.wave === "info"),
+    jammer: s.rules.profiles.find(p => p.team === s.team && p.wave === `jammer_${s.jammer.level}`),
+  };
+  const bad = [];
+  const cmp = (name, cur, ref) => {
+    if (!ref) { bad.push(name); return; }
+    if (cur.freq_hz !== ref.freq_hz) bad.push(name + " 频点");
+    if (cur.bandwidth_hz !== ref.bandwidth_hz) bad.push(name + " 带宽");
+    if (cur.power_dbm !== ref.power_dbm) bad.push(name + " 功率");
+  };
+  cmp("信息波", s.info, want.info);
+  cmp("干扰波", s.jammer, want.jammer);
+  return bad;
+}
+
+// ---- 运行日志：仅在内容变化时重绘，并保持阅读位置 ----
+let logKey = "";
+function renderLogs(logs) {
+  const key = logs.length + "|" + (logs[0] || "");
+  if (key === logKey) return;
+  logKey = key;
+  const box = $("logBox");
+  const fromBottom = box.scrollHeight - box.scrollTop;
+  box.innerHTML = logs.map(l => `<div>${esc(l)}</div>`).join("");
+  box.scrollTop = box.scrollHeight - fromBottom;
+}
+
+function render(s) {
+  const first = !state;
+  state = s;
+
+  $("seasonBadge").textContent = "RMUC " + s.season + " 赛季";
+  $("modeBadge").textContent = s.mode === "pluto" ? "真机 Pluto" : "仿真 sim";
+  $("modeBadge").className = "badge" + (s.mode === "pluto" ? " red" : "");
+
+  if (first) {
+    $("teamSel").value = s.team;
+    $("safetyChk").checked = s.safety_confirmed;
+    $("autoVaryChk").checked = s.auto_vary;
+    $("keyInput").value = s.key;
+    $("levelSel").value = String(s.jammer.level);
+    $("infoAtt").value = s.info.attenuation_db;
+    $("jamAtt").value = s.jammer.attenuation_db;
+    if (s.rules) buildRules(s.rules);
+  }
+  // 等级/密钥控件只在"首次渲染"和"应用切换"成功后同步。
+  // 切勿每次推送(0.5s)都回写服务端值：用户在下拉框选中新等级后会被立刻改回原值，
+  // 表现为"干扰等级无法切换"。
+
+  $("infoAttVal").textContent = s.info.attenuation_db;
+  $("jamAttVal").textContent = s.jammer.attenuation_db;
+
+  $("infoRf").textContent = `${fmtFreq(s.info.freq_hz)} / ${fmtBw(s.info.bandwidth_hz)} / ${fmtDbm(s.info.power_dbm)}`;
+  $("jamRf").textContent = `${fmtFreq(s.jammer.freq_hz)} / ${fmtBw(s.jammer.bandwidth_hz)} / ${fmtDbm(s.jammer.power_dbm)}`;
+
+  $("infoDot").className = "dot" + (s.info.running ? " on" : "");
+  $("jamDot").className = "dot" + (s.jammer.running ? " on" : "");
+  $("infoRunTag").textContent = s.info.running ? "发射中" : "已停止";
+  $("infoRunTag").className = "tag" + (s.info.running ? " ok" : "");
+  $("jamRunTag").textContent = s.jammer.running ? "发射中" : "已停止";
+  $("jamRunTag").className = "tag" + (s.jammer.running ? " ok" : "");
+
+  $("infoMargin").textContent = s.info.stats.stream_margin_ms.toFixed(1) + " ms";
+  $("jamMargin").textContent = s.jammer.stats.stream_margin_ms.toFixed(1) + " ms";
+  $("infoU").textContent = s.info.stats.underflow_count;
+  $("jamU").textContent = s.jammer.stats.underflow_count;
+  $("infoSamples").textContent = s.info.stats.samples_sent.toLocaleString();
+  $("jamSamples").textContent = s.jammer.stats.samples_sent.toLocaleString();
+  $("infoLoopback").innerHTML = fmtLoopback(s.info.loopback);
+  $("jamLoopback").innerHTML = fmtLoopback(s.jammer.loopback);
+
+  // 生效波源与规则核对状态
+  const teamName = s.team === "red" ? "红方" : "蓝方";
+  $("srcBadge").textContent = `生效波源 ${teamName}·广播源 + ${teamName}·${{ 1: "一级", 2: "二级", 3: "三级" }[s.jammer.level]}干扰源`;
+  $("srcBadge").className = "badge " + (s.team === "red" ? "red" : "blue");
+  const bad = checkCompliance(s);
+  $("ruleBadge").textContent = bad.length ? "规则核对 偏差: " + bad.join("、") : "规则核对 通过（表 5-23）";
+  $("ruleBadge").className = "badge " + (bad.length ? "warn" : "ok");
+
+  if (s.rules) highlightRules(s);
+  renderCommands(s.commands);
+  renderLogs(s.logs);
+}
+
+// ---- 控制绑定 ----
+$("teamSel").onchange = () => api("/api/team", "POST", { team: $("teamSel").value });
+$("safetyChk").onchange = () => api("/api/safety", "POST", { confirmed: $("safetyChk").checked });
+$("autoVaryChk").onchange = () => api("/api/auto_vary", "POST", { enabled: $("autoVaryChk").checked });
+$("muteBtn").onclick = async () => {
+  await api("/api/mute", "POST");
+  $("safetyChk").checked = false;
+};
+$("infoStartBtn").onclick = () => api("/api/info/start", "POST");
+$("infoStopBtn").onclick = () => api("/api/info/stop", "POST");
+$("jamStartBtn").onclick = () => api("/api/jammer/start", "POST");
+$("jamStopBtn").onclick = () => api("/api/jammer/stop", "POST");
+// 提交干扰等级 + 密钥。"应用切换"按钮与等级下拉框共用：
+// 下拉框选中即生效，否则用户选完等级不点按钮时，卡片频点、生效波源、
+// 底部规则高亮都停留在旧等级，看起来像"选了没反应"。
+async function applyJammer() {
+  const key = $("keyInput").value.trim();
+  const body = { level: parseInt($("levelSel").value) };
+  // 密钥留空时只切换等级，由服务端按规则重置随机密钥；
+  // 不能把空串当密钥提交，否则会被"密钥必须为数字字母组合"校验拦下
+  if (key) body.key = key;
+  await api("/api/jammer/params", "POST", body);
+  const res = await fetch("/api/state");  // 密钥可能被服务端重置，应用后回写一次与后端保持一致
+  if (res.ok) $("keyInput").value = (await res.json()).key;
+}
+$("jamApplyBtn").onclick = applyJammer;
+$("levelSel").onchange = applyJammer;
+$("keyRandBtn").onclick = () => {
+  const chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let k = "";
+  for (let i = 0; i < 6; i++) k += chars[Math.floor(Math.random() * chars.length)];
+  $("keyInput").value = k;
+  api("/api/jammer/params", "POST", { key: k });
+};
+// 规则要求密钥为 6 位数字字母组合：就地过滤非法字符，避免非法密钥把
+// 等级切换一起带崩（服务端会以"密钥必须为数字字母组合"拒绝整个请求）
+$("keyInput").addEventListener("input", () => {
+  const v = $("keyInput").value.replace(/[^0-9A-Za-z]/g, "").slice(0, 6);
+  if (v !== $("keyInput").value) $("keyInput").value = v;
+});
+$("infoAtt").oninput = () => { $("infoAttVal").textContent = $("infoAtt").value; };
+$("jamAtt").oninput = () => { $("jamAttVal").textContent = $("jamAtt").value; };
+$("infoAtt").onchange = () => api("/api/attenuation", "POST", { wave: "info", attenuation_db: parseFloat($("infoAtt").value) });
+$("jamAtt").onchange = () => api("/api/attenuation", "POST", { wave: "jammer", attenuation_db: parseFloat($("jamAtt").value) });
+
+// ---- 状态更新：WebSocket 推送，断线自动回退轮询 ----
+// WebSocket 每 0.5s 推一次快照；若服务端缺少 websockets 库或连接中断，
+// 则改用 1s 轮询兜底，避免点击按钮后长时间看不到状态变化。
+let wsOk = false;
+
+function setLink(ok) {
+  wsOk = ok;
+  $("linkBadge").textContent = ok ? "链路 实时推送" : "链路 轮询兜底";
+  $("linkBadge").className = "badge " + (ok ? "ok" : "warn");
+}
+
+function connectWs() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onopen = () => setLink(true);
+  ws.onmessage = (ev) => { setLink(true); const s = JSON.parse(ev.data); s._ts = Date.now(); render(s); };
+  ws.onerror = () => setLink(false);
+  ws.onclose = () => { setLink(false); setTimeout(connectWs, 2000); };
+}
+connectWs();
+
+setInterval(async () => {
+  if (wsOk) return;  // 推送正常时无需轮询
+  const res = await fetch("/api/state");
+  if (res.ok) { const s = await res.json(); s._ts = Date.now(); render(s); }
+}, 1000);
+</script>
+</body>
+</html>

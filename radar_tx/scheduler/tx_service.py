@@ -1,0 +1,505 @@
+# -*- coding: utf-8 -*-
+"""发射调度服务：双波形状态机 + 帧生成 + 设备推送 + 仿真回环自检。
+
+设计要点：
+- 状态与执行分离：Web 控制只改内存状态（加锁），发射线程每周期取快照生成帧，
+  因此阵营/等级/密钥/载荷均可热切换而不停发（对齐江南 LabTX 行为）；
+- 射频安全门：未勾选安全确认不得启动任何发射，MUTE 同时停发、拉衰减并撤销确认；
+- sim / pluto 后端可互换，仿真模式走同一套帧与波形代码，仅设备层不同。
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import random
+import struct
+import threading
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Deque, Dict, List, Optional, Tuple
+
+import numpy as np
+
+from ..config import DeviceConfig, DevicesConfig, SeasonConfig
+from ..device.base import TxBackend
+from ..device.pluto_tx import PlutoTx
+from ..device.virtual_sdr import VirtualSdr
+from ..protocol.air_frame import AIR_PAYLOAD_LEN, AirStreamChunker
+from ..protocol.serial_frame import (
+    ALL_CMDS, CMD_FIELD_STATUS, CMD_INTERFERENCE_KEY, CMD_ROBOT_AMMO,
+    CMD_ROBOT_BUFF, CMD_ROBOT_HP, CMD_ROBOT_POSITION, SerialFrameBuilder,
+)
+from ..sim.loopback import LoopbackDecoder
+from ..waveform.gfsk import GfskModulator
+from ..waveform.stream import modulate_air_packets
+
+CMD_NAMES = {
+    CMD_ROBOT_POSITION: "机器人位置",
+    CMD_ROBOT_HP: "机器人血量",
+    CMD_ROBOT_AMMO: "机器人弹量",
+    CMD_FIELD_STATUS: "场地状态",
+    CMD_ROBOT_BUFF: "增益/姿态",
+    CMD_INTERFERENCE_KEY: "干扰密钥",
+}
+INFO_CMDS = (CMD_ROBOT_POSITION, CMD_ROBOT_HP, CMD_ROBOT_AMMO, CMD_FIELD_STATUS, CMD_ROBOT_BUFF)
+
+# 各命令业务载荷字节数（协议 V2.0.0 表 1-44 ~ 1-48）
+CMD_PAYLOAD_LEN = {
+    CMD_ROBOT_POSITION: 24, CMD_ROBOT_HP: 12, CMD_ROBOT_AMMO: 10,
+    CMD_FIELD_STATUS: 8, CMD_ROBOT_BUFF: 41, CMD_INTERFERENCE_KEY: 6,
+}
+
+# 密钥字符集：规则为"6 位数字字母组合"
+_KEY_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+# 规则表 5-23 波源名称（用于 Web 规则核对面板）
+WAVE_LABELS = {
+    ("red", "info"): "红方广播源", ("red", "jammer_1"): "红方一级干扰源",
+    ("red", "jammer_2"): "红方二级干扰源", ("red", "jammer_3"): "红方三级干扰源",
+    ("blue", "info"): "蓝方广播源", ("blue", "jammer_1"): "蓝方一级干扰源",
+    ("blue", "jammer_2"): "蓝方二级干扰源", ("blue", "jammer_3"): "蓝方三级干扰源",
+}
+
+# 敌方场地坐标范围（cm），用于自动变化载荷的随机游走
+_FIELD_X_CM, _FIELD_Y_CM = 2800, 1500
+
+
+@dataclass
+class CommandState:
+    """单条业务命令的发射状态。"""
+    cmd_id: int
+    enabled: bool = True
+    payload_hex: str = ""
+    auto_vary: bool = True
+
+
+class TxService:
+    """模拟发射系统总控。"""
+
+    def __init__(self, season: SeasonConfig, devices: DevicesConfig) -> None:
+        self.season = season
+        self.devices = devices
+        self._lock = threading.RLock()
+        self._logs: Deque[str] = deque(maxlen=200)
+        self._stop = threading.Event()
+        self._threads: Dict[str, threading.Thread] = {}
+        # 每次 start/stop 递增一次；发射线程持有自己的 run_id，
+        # 与当前值不一致即退出。否则"停发后立刻再开"会让上一轮线程
+        # 因 running 又被置位而继续发射，形成双线程并发推流。
+        self._run_ids: Dict[str, int] = {"info": 0, "jammer": 0}
+
+        # ---- 可被 Web 修改的运行状态 ----
+        self.team = "red"
+        self.safety_confirmed = False
+        self.auto_vary = True
+        self.jammer_level = 1
+        # 规则：开局双方干扰波默认一级难度，密钥重置为随机值
+        self.key = self._random_key().decode("ascii")
+        self.info_running = False
+        self.jammer_running = False
+        self.attenuation = {
+            "info": float(devices.info_tx.attenuation_db),
+            "jammer": float(devices.jammer_tx.attenuation_db),
+        }
+        self.cmds: Dict[int, CommandState] = {
+            cmd: CommandState(cmd_id=cmd) for cmd in INFO_CMDS
+        }
+        self._coords = [random.randint(0, _FIELD_X_CM) if i % 2 == 0 else random.randint(0, _FIELD_Y_CM)
+                        for i in range(12)]
+
+        # ---- 发射链路 ----
+        self._mods: Dict[Tuple[str, str], GfskModulator] = {}
+        self._loopback = LoopbackDecoder(season)
+        self._last_loopback: Dict[str, dict] = {"info": {}, "jammer": {}}
+        # 回环解码线程池：解码必须离开发射线程，否则会拖慢仿真节拍（见 _make_backend）
+        self._decode_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="loopback")
+        self.backends: Dict[str, TxBackend] = {
+            "info": self._make_backend(devices.info_tx, "info"),
+            "jammer": self._make_backend(devices.jammer_tx, "jammer"),
+        }
+        self._log(f"初始化完成：模式={devices.mode}，赛季={season.season}")
+
+    # ==================== 内部工具 ====================
+
+    def _log(self, msg: str) -> None:
+        self._logs.appendleft(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
+    def _make_backend(self, dev: DeviceConfig, wave: str) -> TxBackend:
+        if self.devices.mode == "pluto":
+            return PlutoTx(dev.uri, underflow_gap_ms=self.devices.underflow_gap_ms)
+
+        def on_iq(iq: np.ndarray, wave: str = wave) -> None:
+            # 回环解调放到独立线程：单周期解码约 15ms，若留在发射线程会挤占节拍，
+            # 既让仿真跑得比实时慢，也把自身开销计入供样余量，出现虚假的负余量。
+            self._decode_pool.submit(self._decode_loopback, wave, iq)
+
+        return VirtualSdr(
+            sample_rate=self.season.modulation.SAMPLE_RATE_HZ,
+            on_iq=on_iq,
+            underflow_gap_ms=self.devices.underflow_gap_ms,
+            realtime=True,
+        )
+
+    def _decode_loopback(self, wave: str, iq: np.ndarray) -> None:
+        """仿真回环自检：解码发射波形并缓存结果供诊断面板显示。"""
+        try:
+            result = self._loopback.decode(iq, is_info=(wave == "info"))
+            self._last_loopback[wave] = {
+                "ok": True,
+                "air_payloads": len(result.air_payloads),
+                "frames": len(result.frames),
+                "cmd_ids": [hex(f.cmd_id) for f in result.frames],
+            }
+        except Exception as exc:  # 回环失败要暴露到界面而不是静默
+            self._last_loopback[wave] = {"ok": False, "error": str(exc)}
+
+    def _modulator(self, wave: str) -> GfskModulator:
+        key = (self.team, wave)
+        if key not in self._mods:
+            profile = self.season.profile(self.team, wave if wave == "info" else f"jammer_{self.jammer_level}")
+            self._mods[key] = GfskModulator(self.season.modulation, profile)
+        return self._mods[key]
+
+    def _rf_params(self, wave: str) -> Tuple[int, int, int]:
+        """当前 (freq, bandwidth, rule_power) 三元组。"""
+        name = "info" if wave == "info" else f"jammer_{self.jammer_level}"
+        p = self.season.profile(self.team, name)
+        return p.freq_hz, p.bandwidth_hz, p.power_dbm
+
+    def _gen_payload(self, cmd_id: int) -> bytes:
+        """生成语义合法的业务载荷（自动变化/随机按钮共用）。"""
+        if cmd_id == CMD_ROBOT_POSITION:
+            # 随机游走，模拟场地内移动
+            for i in range(0, 12, 2):
+                self._coords[i] = max(0, min(_FIELD_X_CM, self._coords[i] + random.randint(-300, 300)))
+                self._coords[i + 1] = max(0, min(_FIELD_Y_CM, self._coords[i + 1] + random.randint(-200, 200)))
+            return struct.pack("<12h", *self._coords)
+        if cmd_id == CMD_ROBOT_HP:
+            # 序列：英雄/工程/3步/4步/保留/哨兵，第 5 项为保留位恒 0（协议表 1-45）
+            hps = [random.randint(0, 600) for _ in range(6)]
+            hps[4] = 0
+            return struct.pack("<6H", *hps)
+        if cmd_id == CMD_ROBOT_AMMO:
+            return struct.pack("<5H", *(random.randint(0, 500) for _ in range(5)))
+        if cmd_id == CMD_FIELD_STATUS:
+            return struct.pack("<HHI", random.randint(0, 2000), 2000, random.randint(0, 7))
+        if cmd_id == CMD_ROBOT_BUFF:
+            # 5 台机器人 × 7B 增益（回血1+冷却2+防御1+负防御1+攻击2）+ 6B 尾部，共 41B
+            buf = bytearray()
+            for _ in range(5):
+                buf += struct.pack("<BHBBH", random.randint(0, 100), random.randint(0, 50),
+                                   random.randint(0, 100), random.randint(0, 100), random.randint(0, 100))
+            buf += os.urandom(6)
+            return bytes(buf)
+        if cmd_id == CMD_INTERFERENCE_KEY:
+            return self._random_key()
+        raise ValueError(f"未知命令 {hex(cmd_id)}")
+
+    def _random_key(self) -> bytes:
+        """规则：6 位数字字母组合密钥。"""
+        return "".join(random.choice(_KEY_ALPHABET)
+                       for _ in range(self.season.key_len)).encode("ascii")
+
+    # ==================== 发射线程 ====================
+
+    def _engine_loop(self, wave: str, run_id: int) -> None:
+        period = 1.0 / self.season.cycles_per_sec
+        # 周期 IQ 补零到整周期采样数：供样量与设备消耗速率严格相等，
+        # 否则每周期 8.6% 的供样亏空在真机上必然欠采
+        cycle_samples = self.season.modulation.SAMPLE_RATE_HZ // self.season.cycles_per_sec
+        builder = SerialFrameBuilder()
+        # 空口流按 15 字节连续切片且跨周期保留余量（规则附录 1：数据流连续切分）
+        chunker = AirStreamChunker(
+            self.season.access_code_info if wave == "info" else self.season.access_code_interfere)
+        cycle_index = 0
+        next_tick = time.monotonic()
+        while not self._stop.is_set():
+            with self._lock:
+                # run_id 失效说明已被 stop/MUTE 或新一轮 start 取代，本线程必须退出，
+                # 不能只看 running：新一轮 start 会把 running 重新置位，导致双线程并发推流
+                if self._run_ids[wave] != run_id:
+                    break
+                running = self.info_running if wave == "info" else self.jammer_running
+            if not running:
+                break
+            next_tick += period  # 绝对截止时间调度，避免节拍漂移累积
+            try:
+                if wave == "info":
+                    stream = self._build_info_stream(builder)
+                else:
+                    stream = self._build_jammer_stream(builder, cycle_index)
+                packets = chunker.feed(stream)
+                iq = modulate_air_packets(packets, self._modulator(wave))
+                if len(iq) < cycle_samples:
+                    iq = np.pad(iq, (0, cycle_samples - len(iq)))
+                backend = self.backends[wave]
+                freq, bw, _ = self._rf_params(wave)
+                backend.configure(freq, bw, self.attenuation[wave], self.season.modulation.SAMPLE_RATE_HZ)
+                backend.transmit(iq)
+                cycle_index += 1
+            except Exception as exc:
+                self._log(f"{wave} 发射异常：{exc}")
+                with self._lock:
+                    self._run_ids[wave] += 1  # 让本线程彻底退出，避免异常后残留
+                    if wave == "info":
+                        self.info_running = False
+                    else:
+                        self.jammer_running = False
+                break
+            time.sleep(max(0.0, next_tick - time.monotonic()))
+        self._log(f"{wave} 发射已停止")
+
+    def _build_info_stream(self, builder: SerialFrameBuilder) -> bytes:
+        """信息波周期流：140B，全部为 0x0A01~0x0A05 有效帧（规则 1400B/s @10Hz）。
+
+        关闭的命令位用等长随机字节占位：保持字节速率与官方一致，
+        同时保留"关闭包位填随机字节"的接收压测能力。
+        """
+        with self._lock:
+            stream = b""
+            for cmd in INFO_CMDS:
+                st = self.cmds[cmd]
+                if not st.enabled:
+                    # 帧长 = 载荷 + 帧头5 + cmd2 + CRC16 2
+                    stream += os.urandom(CMD_PAYLOAD_LEN[cmd] + 9)
+                    continue
+                if self.auto_vary and st.auto_vary:
+                    st.payload_hex = self._gen_payload(cmd).hex()
+                elif len(st.payload_hex) != CMD_PAYLOAD_LEN[cmd] * 2:
+                    # 从未生成过载荷时补齐（例如开启发射前就关掉了自动变化），
+                    # 否则会发出 data_length=0 的畸形帧，字节速率也不符规则
+                    st.payload_hex = self._gen_payload(cmd).hex()
+                stream += builder.pack(cmd, bytes.fromhex(st.payload_hex))
+        return stream
+
+    def _build_jammer_stream(self, builder: SerialFrameBuilder, cycle_index: int) -> bytes:
+        """干扰波周期流：135B（规则 1350B/s = 9 空口包），1 帧 0x0A06 + 随机填充。
+
+        密钥帧位置逐周期变化，覆盖不同 15 字节切片对齐情况。
+        """
+        with self._lock:
+            key = self.key
+        key_frame = builder.pack_key(key)  # 恰好 15B = 1 个空口包载荷
+        total = self.season.jammer_bytes_per_cycle
+        offset = (cycle_index * 7) % AIR_PAYLOAD_LEN
+        return os.urandom(offset) + key_frame + os.urandom(total - offset - len(key_frame))
+
+    # ==================== 控制接口 ====================
+
+    def start(self, wave: str) -> None:
+        if wave not in ("info", "jammer"):
+            raise ValueError("wave 必须为 info / jammer")
+        with self._lock:
+            if not self.safety_confirmed:
+                raise ValueError("未勾选射频安全确认，禁止发射")
+            if self.info_running if wave == "info" else self.jammer_running:
+                return
+        # 上一轮线程可能还在收尾（最多一个周期）：先等它退出再起新线程。
+        # 否则"停发后立刻再开"会有新旧两个线程同时向同一台设备推流。
+        old = self._threads.get(wave)
+        if old is not None and old.is_alive():
+            old.join(timeout=1.0)
+        with self._lock:
+            if wave == "info":
+                self.info_running = True
+            else:
+                self.jammer_running = True
+            # 换发新的 run_id，令任何仍在收尾的旧线程失效
+            self._run_ids[wave] += 1
+            run_id = self._run_ids[wave]
+        thread = threading.Thread(target=self._engine_loop, args=(wave, run_id),
+                                  daemon=True, name=f"tx-{wave}")
+        self._threads[wave] = thread
+        thread.start()
+        self._log(f"{wave} 开始发射")
+
+    def stop(self, wave: str) -> None:
+        with self._lock:
+            # 递增 run_id 即让当前发射线程失效：即使紧接着又点了"开始发射"，
+            # 旧线程也会退出，不会与新线程同时推流
+            self._run_ids[wave] += 1
+            if wave == "info":
+                self.info_running = False
+            else:
+                self.jammer_running = False
+        # 立即记日志：发射线程需完成当前周期（约 100 ms）才退出，
+        # 界面在等到下一次状态推送前先给出"指令已下发"的反馈
+        self._log(f"{wave} 停止指令已下发")
+
+    def mute_all(self) -> None:
+        """硬静音：停发 + 衰减拉满 + 撤销安全确认。"""
+        with self._lock:
+            self.info_running = False
+            self.jammer_running = False
+            self.safety_confirmed = False
+            for wave in ("info", "jammer"):
+                self._run_ids[wave] += 1  # 与 stop 同理，彻底作废在跑的发射线程
+        for backend in self.backends.values():
+            backend.mute()
+        self._log("全局静音（MUTE）已执行，安全确认已撤销")
+
+    def set_safety(self, confirmed: bool) -> None:
+        with self._lock:
+            self.safety_confirmed = bool(confirmed)
+        self._log(f"射频安全确认：{'已勾选' if confirmed else '已取消'}")
+
+    def set_team(self, team: str) -> None:
+        if team not in self.season.profiles:
+            raise ValueError("阵营必须为 red / blue")
+        with self._lock:
+            self.team = team
+            self._mods.clear()  # 阵营切换即换频点/带宽，调制器缓存失效
+        self._log(f"阵营切换为 {team}")
+
+    def set_auto_vary(self, enabled: bool) -> None:
+        with self._lock:
+            self.auto_vary = bool(enabled)
+            if enabled:
+                # 重新开启自动变化即"解锁"全部命令：否则之前手动编辑过的命令
+                # 会一直停留在锁定态，看起来像自动变化开关失效
+                for st in self.cmds.values():
+                    st.auto_vary = True
+
+    def set_command(self, cmd_id: int, enabled: Optional[bool] = None,
+                    payload_hex: Optional[str] = None) -> None:
+        self._require_info_cmd(cmd_id)
+        with self._lock:
+            st = self.cmds[cmd_id]
+            if enabled is not None:
+                st.enabled = bool(enabled)
+            if payload_hex is not None:
+                raw = bytes.fromhex(payload_hex)  # 非法 hex 抛 ValueError，由 API 层转 400
+                expected = CMD_PAYLOAD_LEN[cmd_id]
+                if len(raw) != expected:
+                    raise ValueError(f"{hex(cmd_id)} 载荷必须为 {expected} 字节")
+                st.payload_hex = raw.hex()
+                st.auto_vary = False  # 手动编辑后锁定该命令，否则会被自动变化覆盖
+
+    def randomize_command(self, cmd_id: int) -> None:
+        self._require_info_cmd(cmd_id)
+        with self._lock:
+            self.cmds[cmd_id].payload_hex = self._gen_payload(cmd_id).hex()
+
+    @staticmethod
+    def _require_info_cmd(cmd_id: int) -> None:
+        """仅 0x0A01~0x0A05 为信息波业务命令；越界必须报错，
+        否则 self.cmds[cmd_id] 会抛 KeyError 变成 HTTP 500。"""
+        if cmd_id not in INFO_CMDS:
+            raise ValueError(f"不支持的命令号 {hex(cmd_id)}，仅支持 0x0A01~0x0A05")
+
+    def set_jammer(self, level: Optional[int] = None, key: Optional[str] = None) -> None:
+        # 仅切换等级时密钥留空，等价于"未提供密钥"：按规则重置为随机值，
+        # 不能把空串当密钥校验，否则等级切换会被"密钥必须为数字字母组合"误拦。
+        if isinstance(key, str) and not key.strip():
+            key = None
+        with self._lock:
+            if level is not None:
+                if level not in (1, 2, 3):
+                    raise ValueError("干扰等级必须为 1 / 2 / 3")
+                self.jammer_level = int(level)
+                self._mods.pop((self.team, "jammer"), None)  # 等级切换换频点/带宽
+                if key is None:
+                    # 规则：干扰波难度变化时密钥重置为随机值
+                    self.key = self._random_key().decode("ascii")
+            if key is not None:
+                raw = key.encode("ascii", errors="ignore")
+                if len(raw) > self.season.key_len:
+                    raise ValueError(f"密钥最长 {self.season.key_len} 个 ASCII 字符")
+                if not raw.decode("ascii").isalnum():
+                    raise ValueError("密钥必须为数字字母组合")
+                self.key = raw.decode("ascii")
+        self._log(f"干扰参数：等级 {self.jammer_level}，密钥 {self.key}")
+
+    def set_attenuation(self, wave: str, attenuation_db: float) -> None:
+        limits = self.season.tx_limits
+        if not (limits["attenuation_db_min"] <= attenuation_db <= limits["attenuation_db_max"]):
+            raise ValueError("衰减超出允许范围")
+        with self._lock:
+            self.attenuation[wave] = float(attenuation_db)
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        with self._lock:
+            self.info_running = False
+            self.jammer_running = False
+        for t in self._threads.values():
+            t.join(timeout=2.0)
+        self._decode_pool.shutdown(wait=False, cancel_futures=True)
+        for backend in self.backends.values():
+            backend.close()
+        self._log("服务已关闭")
+
+    # ==================== 状态快照（Web） ====================
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            commands = [
+                {
+                    "cmd_id": hex(cmd),
+                    "name": CMD_NAMES[cmd],
+                    "enabled": self.cmds[cmd].enabled,
+                    "payload_hex": self.cmds[cmd].payload_hex,
+                    # 全局开关与命令自身状态取"与"：全局关闭即全部冻结在该命令当前载荷，
+                    # 命令被手动编辑后也应锁定（取"或"会让全局开关失效并覆盖手动载荷）
+                    "auto_vary": self.auto_vary and self.cmds[cmd].auto_vary,
+                }
+                for cmd in INFO_CMDS
+            ]
+            info_freq, info_bw, info_power = self._rf_params("info")
+            jam_freq, jam_bw, jam_power = self._rf_params("jammer")
+            return {
+                "season": self.season.season,
+                "mode": self.devices.mode,
+                "rules": self._rules_snapshot(),
+                "team": self.team,
+                "safety_confirmed": self.safety_confirmed,
+                "auto_vary": self.auto_vary,
+                "key": self.key,
+                "commands": commands,
+                "info": {
+                    "running": self.info_running,
+                    "freq_hz": info_freq, "bandwidth_hz": info_bw, "power_dbm": info_power,
+                    "attenuation_db": self.attenuation["info"],
+                    "stats": self.backends["info"].stats.__dict__.copy(),
+                    "loopback": self._last_loopback.get("info", {}),
+                },
+                "jammer": {
+                    "running": self.jammer_running,
+                    "level": self.jammer_level,
+                    "freq_hz": jam_freq, "bandwidth_hz": jam_bw, "power_dbm": jam_power,
+                    "attenuation_db": self.attenuation["jammer"],
+                    "stats": self.backends["jammer"].stats.__dict__.copy(),
+                    "loopback": self._last_loopback.get("jammer", {}),
+                },
+                "logs": list(self._logs),
+            }
+
+    def _rules_snapshot(self) -> dict:
+        """规则核对数据：表 5-23 全部波源参数 + 调制参数，供 Web 面板显示。"""
+        mod = self.season.modulation
+        profiles = []
+        for team in ("red", "blue"):
+            for wave in ("info", "jammer_1", "jammer_2", "jammer_3"):
+                p = self.season.profile(team, wave)
+                profiles.append({
+                    "label": WAVE_LABELS[(team, wave)],
+                    "team": team,
+                    "wave": wave,
+                    "freq_hz": p.freq_hz,
+                    "bandwidth_hz": p.bandwidth_hz,
+                    "power_dbm": p.power_dbm,
+                    # 调频灵敏度 = 2π·Δf/SampleRate（rad/sample），与规则表 5-23 一致
+                    "sensitivity": round(2 * math.pi * p.freq_deviation_hz / mod.SAMPLE_RATE_HZ, 4),
+                })
+        return {
+            "source": "规则手册 V2.2.0 表 5-23/附录 1 · 通信协议 V2.0.0",
+            "modulation": "2-GFSK · SPS=47 · BT=0.35 · 采样率 1MS/s · 无前导码/白化/FEC",
+            "access_code_info": self.season.access_code_info.hex().upper(),
+            "access_code_interfere": self.season.access_code_interfere.hex().upper(),
+            "info_rate": "1400 B/s · 0x0A01~0x0A05 全有效数据 · 各命令 10Hz",
+            "jammer_rate": "1350 B/s · 0x0A06 10Hz + 随机填充",
+            "profiles": profiles,
+        }

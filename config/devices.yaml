@@ -1,0 +1,20 @@
+# 双 PlutoSDR 发射设备配置
+# 两块板必须处于不同子网（修改各自固件 config.txt），详见 README 部署说明。
+# mode: sim = 虚拟 SDR（无硬件回环自检）；pluto = 真实设备。
+
+mode: sim
+
+info_tx:
+  name: "信息波发射板"
+  uri: "ip:192.168.2.1"
+  attenuation_db: 40
+
+jammer_tx:
+  name: "干扰波发射板"
+  uri: "ip:192.168.3.1"
+  attenuation_db: 40
+
+# 发射流送参数
+stream:
+  tx_buffer_samples: 32768     # 单次推送到设备的采样数
+  underflow_gap_ms: 30         # 欠采告警余量；Windows 调度粒度约 15ms，留两档抖动余量

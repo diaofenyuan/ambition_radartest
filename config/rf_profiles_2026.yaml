@@ -1,0 +1,45 @@
+# RMUC2026 赛季无线电规则参数（规则 V2.0.x 口径）
+# 来源：同济 SuperPower 开源 constants.py（规则 V2.0.0 表 5-23）与复旦 FDUEGA 波源配置交叉核对。
+# 27 赛季规则发布后只需替换本文件，不动代码。
+
+season: 2026
+
+modulation:
+  type: 2-GFSK
+  sample_rate_hz: 1000000      # 1 MS/s
+  samples_per_symbol: 47       # 码率 = 1e6/47 ≈ 21276.6 bps
+  gfsk_bt: 0.35                # 高斯滤波带宽×符号时长积
+  gaussian_span_symbols: 4     # 高斯滤波器跨 4 个符号
+
+air_protocol:
+  access_code_info: "2F6F4C74B914492E"
+  access_code_interfere: "16E8D377151C712D"
+  header: "000F000F"
+  payload_len: 15
+  packets_per_cycle: 9
+  cycles_per_sec: 10
+
+business:
+  key_len_ascii: 6             # 0x0A06 密钥固定 6 字节（数字字母组合）
+  key_pad_char: "0"
+  buff_payload_lens: [41]      # 0x0A05 载荷 41 字节（协议 V2.0.0 表 1-48）
+  info_bytes_per_cycle: 140    # 信息波 1400B/s = 140B/周期，全部为 0x0A01~0x0A05 有效数据
+  jammer_bytes_per_cycle: 135  # 干扰波 1350B/s = 135B/周期 = 9 空口包，含 1 帧 0x0A06 + 随机填充
+
+# 频点 / 带宽 / 规则标称功率。频偏由带宽推导：f_dev = bandwidth/2 - bit_rate
+rf_profiles:
+  red:
+    info:      { freq_hz: 433200000, bandwidth_hz: 540000, power_dbm: -60 }
+    jammer_1:  { freq_hz: 432200000, bandwidth_hz: 940000, power_dbm: -10 }
+    jammer_2:  { freq_hz: 432500000, bandwidth_hz: 860000, power_dbm: -10 }
+    jammer_3:  { freq_hz: 432800000, bandwidth_hz: 250000, power_dbm: -10 }
+  blue:
+    info:      { freq_hz: 433920000, bandwidth_hz: 540000, power_dbm: -60 }
+    jammer_1:  { freq_hz: 434920000, bandwidth_hz: 940000, power_dbm: -10 }
+    jammer_2:  { freq_hz: 434620000, bandwidth_hz: 860000, power_dbm: -10 }
+    jammer_3:  { freq_hz: 434320000, bandwidth_hz: 250000, power_dbm: -10 }
+
+tx_limits:
+  attenuation_db_min: 0        # 发射衰减调节范围（硬件增益域）
+  attenuation_db_max: 89
+  default_attenuation_db: 40   # 默认大衰减起步，符合"低功率先行"的测试要求
