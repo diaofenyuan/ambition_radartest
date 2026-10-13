@@ -236,8 +236,17 @@ class TxService:
                 if len(iq) < cycle_samples:
                     iq = np.pad(iq, (0, cycle_samples - len(iq)))
                 backend = self.backends[wave]
-                freq, bw, _ = self._rf_params(wave)
-                backend.configure(freq, bw, self.attenuation[wave], self.season.modulation.SAMPLE_RATE_HZ)
+                # 衰减下发必须与 MUTE 的"衰减拉满"在同一把锁内，且下发前重新校验 run_id：
+                # 否则 MUTE 递增 run_id 后，已在周期体中的这次发射仍会用它持有的配置衰减
+                # （self.attenuation，如 40dB）覆盖掉刚拉满的 89dB，MUTE 硬静音偶发失效。
+                # 推流（transmit）可能阻塞（真机或仿真占位），故放在锁外，仅锁住参数下发。
+                with self._lock:
+                    if self._run_ids[wave] != run_id:
+                        break
+                    if not (self.info_running if wave == "info" else self.jammer_running):
+                        break
+                    freq, bw, _ = self._rf_params(wave)
+                    backend.configure(freq, bw, self.attenuation[wave], self.season.modulation.SAMPLE_RATE_HZ)
                 backend.transmit(iq)
                 cycle_index += 1
             except Exception as exc:
@@ -337,8 +346,11 @@ class TxService:
             self.safety_confirmed = False
             for wave in ("info", "jammer"):
                 self._run_ids[wave] += 1  # 与 stop 同理，彻底作废在跑的发射线程
-        for backend in self.backends.values():
-            backend.mute()
+            # 衰减拉满与发射周期的参数下发互斥：否则在途周期的 configure 会用配置衰减
+            # 覆盖这里拉满的 89dB（MUTE 硬静音偶发失效）。backend.mute() 内部锁为
+            # 服务锁→后端锁，与 configure 一致，无锁序反转。
+            for backend in self.backends.values():
+                backend.mute()
         self._log("全局静音（MUTE）已执行，安全确认已撤销")
 
     def set_safety(self, confirmed: bool) -> None:

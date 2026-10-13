@@ -76,3 +76,19 @@ def test_rapid_restart_leaves_no_stale_tx_thread(service):
     time.sleep(0.3)
     assert not old.is_alive(), "旧发射线程未退出，会与新线程并发推流"
     assert service._threads["info"].is_alive()
+
+
+def test_mute_pulls_attenuation_to_max_despite_inflight_cycle(service):
+    # MUTE 的"衰减拉满"必须与在途发射周期的参数下发互斥：
+    # 修复前，已在周期体中的发射会用配置衰减(40dB)覆盖刚拉满的 89dB，偶发失效。
+    # 反复在发射中段触发 MUTE，验证衰减恒为 89。
+    for _ in range(20):
+        service.set_safety(True)  # MUTE 会撤销安全确认，每轮重新勾选
+        service.start("info")
+        time.sleep(0.12)  # 让发射线程进入周期体
+        service.mute_all()
+        snap = service.snapshot()
+        assert snap["info"]["running"] is False
+        assert snap["info"]["stats"]["attenuation_db"] == 89.0, "MUTE 衰减被在途周期覆盖"
+    service.stop("info")
+
