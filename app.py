@@ -29,9 +29,15 @@ def main() -> None:
         devices.mode = args.mode
 
     service = TxService(season, devices)
-    app = create_app(service)
+    def request_exit() -> None:
+        server.should_exit = True
+
+    app = create_app(service, on_ui_closed=request_exit)
+    server = uvicorn.Server(uvicorn.Config(
+        app, host=args.host, port=args.port, log_level="warning",
+    ))
     print(f"发射系统启动：http://{args.host}:{args.port}  模式={devices.mode}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    server.run()
 
 
 if __name__ == "__main__":

@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+from collections.abc import Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from radar_tx.scheduler.tx_service import TxService
+from .ui_session import UiSessions
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -47,8 +51,34 @@ class AttenuationBody(BaseModel):
     attenuation_db: float
 
 
-def create_app(service: TxService) -> FastAPI:
-    app = FastAPI(title="雷达无线电自测模拟发射系统", on_shutdown=[service.shutdown])
+def create_app(service: TxService, on_ui_closed: Callable[[], None] | None = None) -> FastAPI:
+    sessions = UiSessions()
+
+    async def watch_ui():
+        while True:
+            await asyncio.sleep(0.5)
+            if sessions.should_exit():
+                print("所有界面已关闭，正在静音并退出后端……", flush=True)
+                try:
+                    await asyncio.to_thread(service.mute_all)
+                except Exception:
+                    logging.exception("退出前执行 MUTE 失败，继续释放设备")
+                finally:
+                    on_ui_closed()
+                return
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        watcher = asyncio.create_task(watch_ui()) if on_ui_closed is not None else None
+        try:
+            yield
+        finally:
+            if watcher is not None:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+            await asyncio.to_thread(service.shutdown)
+
+    app = FastAPI(title="雷达无线电自测模拟发射系统", lifespan=lifespan)
 
     def _call(fn, *args, **kwargs):
         try:
@@ -62,8 +92,15 @@ def create_app(service: TxService) -> FastAPI:
         return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
     @app.get("/api/state")
-    def state():
+    async def state(ui_session: str | None = Query(None, min_length=1, max_length=64)):
+        if ui_session is not None:
+            sessions.touch(ui_session)
         return service.snapshot()
+
+    @app.post("/api/ui/{session_id}/close")
+    async def close_ui(session_id: str):
+        sessions.discard(session_id, closed=True)
+        return {"ok": True}
 
     @app.post("/api/safety")
     def safety(body: SafetyBody):
@@ -136,16 +173,22 @@ def create_app(service: TxService) -> FastAPI:
         return {"ok": True}
 
     @app.websocket("/ws")
-    async def ws_push(websocket: WebSocket):
+    async def ws_push(websocket: WebSocket,
+                      ui_session: str | None = Query(None, min_length=1, max_length=64)):
         """每 0.5 s 推送一次状态快照，界面无需轮询。"""
         await websocket.accept()
         try:
             while True:
+                if ui_session is not None:
+                    sessions.touch(ui_session)
                 await websocket.send_text(json.dumps(service.snapshot(), ensure_ascii=False))
                 await asyncio.sleep(0.5)
         except (WebSocketDisconnect, RuntimeError, ConnectionError):
             # 客户端直接关页/断网时，send 可能抛 RuntimeError/ConnectionError 而不是
             # WebSocketDisconnect；推送循环直接结束即可，不必让异常冒泡刷栈
             pass
+        finally:
+            if ui_session is not None:
+                sessions.discard(ui_session)
 
     return app

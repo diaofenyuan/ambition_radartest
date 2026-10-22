@@ -68,8 +68,9 @@ if not exist "%MARKER%" (
     echo [初始化] 依赖安装完成。
 )
 
-REM 4) 启动服务，并延时自动打开控制台页面
+REM 4) 启动服务，并延时自动打开控制台页面；最后一个页面关闭后后端自动退出
 echo [启动] 雷达无线电自测模拟发射系统 ...  http://%HOST%:%PORT%
+echo [提示] 关闭最后一个控制台页面约 3 秒后，自动静音并退出后端。
 echo.
 REM 独立后台进程等待端口就绪后打开浏览器，避免与前台服务互阻塞
 start "" /b powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 2; Start-Process 'http://%HOST%:%PORT%'"
@@ -77,4 +78,4 @@ start "" /b powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Sec
 
 echo.
 echo 服务已退出。
-pause
+exit /b

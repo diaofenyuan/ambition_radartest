@@ -454,6 +454,34 @@ $("jamAtt").onchange = () => api("/api/attenuation", "POST", { wave: "jammer", a
 // WebSocket 每 0.5s 推一次快照；若服务端缺少 websockets 库或连接中断，
 // 则改用 1s 轮询兜底，避免点击按钮后长时间看不到状态变化。
 let wsOk = false;
+let pageClosing = false;
+let socket = null;
+let reconnectTimer = null;
+let uiSession = newUiSession();
+
+function newUiSession() {
+  return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+}
+
+// pagehide 覆盖关页和跳转；刷新时由后端宽限期等待新页面接管。
+window.addEventListener("pagehide", () => {
+  pageClosing = true;
+  clearTimeout(reconnectTimer);
+  if (socket) socket.close();
+  const url = `/api/ui/${uiSession}/close`;
+  if (!navigator.sendBeacon(url)) {
+    fetch(url, { method: "POST", keepalive: true }).catch(() => {});
+  }
+});
+
+window.addEventListener("pageshow", (ev) => {
+  if (!ev.persisted) return;
+  // 从往返缓存恢复时创建新会话，避免复用已关闭页面的身份。
+  uiSession = newUiSession();
+  pageClosing = false;
+  connectWs();
+  pollState();
+});
 
 function setLink(ok) {
   wsOk = ok;
@@ -462,20 +490,32 @@ function setLink(ok) {
 }
 
 function connectWs() {
+  if (pageClosing) return;
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws?ui_session=${uiSession}`);
+  socket = ws;
   ws.onopen = () => setLink(true);
   ws.onmessage = (ev) => { setLink(true); const s = JSON.parse(ev.data); s._ts = Date.now(); render(s); };
   ws.onerror = () => setLink(false);
-  ws.onclose = () => { setLink(false); setTimeout(connectWs, 2000); };
+  ws.onclose = () => {
+    if (socket !== ws) return;
+    setLink(false);
+    if (!pageClosing) reconnectTimer = setTimeout(connectWs, 2000);
+  };
 }
 connectWs();
 
-setInterval(async () => {
-  if (wsOk) return;  // 推送正常时无需轮询
-  const res = await fetch("/api/state");
-  if (res.ok) { const s = await res.json(); s._ts = Date.now(); render(s); }
-}, 1000);
+async function pollState() {
+  if (pageClosing || wsOk) return;  // 推送正常时无需轮询
+  try {
+    const res = await fetch(`/api/state?ui_session=${uiSession}`);
+    if (res.ok && !pageClosing) { const s = await res.json(); s._ts = Date.now(); render(s); }
+  } catch (_) {
+    setLink(false);
+  }
+}
+pollState();
+setInterval(pollState, 1000);
 </script>
 </body>
 </html>
