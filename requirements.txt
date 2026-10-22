@@ -7,5 +7,7 @@ pyyaml>=6.0
 pydantic>=2.0
 # 真机发射（sim 模式可不装）
 pyadi-iio>=0.0.14
+# Windows 原生库采用 0.x ABI，约束绑定版本以避免升级后无法加载。
+pylibiio>=0.25,<1.0
 # 测试
 pytest>=8.0
