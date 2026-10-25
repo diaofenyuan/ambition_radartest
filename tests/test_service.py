@@ -107,8 +107,12 @@ DEVICE = DiscoveredDevice(
 
 
 def test_scan_dedupes_same_board_and_ignores_non_pluto(monkeypatch):
-    pytest.importorskip("iio")
-    import iio
+    # 装了 pylibiio 但缺 libiio 原生库时抛 TypeError 而非 ImportError，
+    # importorskip 兜不住，需自行降级为 skip。
+    try:
+        import iio
+    except Exception:
+        pytest.skip("未加载到 libiio 原生库，跳过真机扫描用例")
 
     contexts = {
         "usb:1.6.5": "0456:b673 (Analog Devices Inc. PlutoSDR (ADALM-PLUTO)), serial=03df62",

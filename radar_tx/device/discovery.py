@@ -51,7 +51,10 @@ def scan_pluto_devices() -> list[DiscoveredDevice]:
     """扫描当前主机可见的 PlutoSDR；无依赖或扫描失败时返回空列表。"""
     try:
         import iio  # 延迟导入：仿真环境无需安装 libiio 绑定
-    except ImportError:
+    except Exception:
+        # 仅装了 pylibiio 纯 Python 绑定、机器上没有 libiio 原生库时，
+        # import 阶段抛的是 OSError/TypeError 而不是 ImportError。
+        # 仿真模式必须容忍这种环境，按"无设备"处理。
         return []
     try:
         contexts = iio.scan_contexts() or {}
