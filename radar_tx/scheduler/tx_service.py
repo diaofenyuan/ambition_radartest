@@ -19,12 +19,13 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ..config import DeviceConfig, DevicesConfig, SeasonConfig
+from ..config import DevicesConfig, SeasonConfig
 from ..device.base import TxBackend
+from ..device.discovery import DiscoveredDevice, scan_pluto_devices
 from ..device.pluto_tx import PlutoTx
 from ..device.virtual_sdr import VirtualSdr
 from ..protocol.air_frame import AIR_PAYLOAD_LEN, AirStreamChunker
@@ -79,9 +80,15 @@ class CommandState:
 class TxService:
     """模拟发射系统总控。"""
 
-    def __init__(self, season: SeasonConfig, devices: DevicesConfig) -> None:
+    def __init__(self, season: SeasonConfig, devices: DevicesConfig,
+                 device_scanner: Callable[[], List[DiscoveredDevice]] | None = None) -> None:
         self.season = season
         self.devices = devices
+        self._device_scanner = device_scanner or scan_pluto_devices
+        self._discovered_devices: List[DiscoveredDevice] = []
+        # 波源到物理设备的动态绑定：为空时使用虚拟 SDR。
+        # 这样同一块板可以在界面上被指定为信息波或干扰波，而不必改配置文件。
+        self._assignments: Dict[str, Optional[str]] = {"info": None, "jammer": None}
         self._lock = threading.RLock()
         self._logs: Deque[str] = deque(maxlen=200)
         self._stop = threading.Event()
@@ -116,20 +123,81 @@ class TxService:
         self._last_loopback: Dict[str, dict] = {"info": {}, "jammer": {}}
         # 回环解码线程池：解码必须离开发射线程，否则会拖慢仿真节拍（见 _make_backend）
         self._decode_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="loopback")
+        self._discovered_devices = self._read_devices()
+        if self.devices.mode == "pluto":
+            # 兼容原有配置文件模式：启动即按配置 URI 绑定，仍可在界面上改绑扫描到的设备
+            self._assignments = {
+                "info": self.devices.info_tx.uri,
+                "jammer": self.devices.jammer_tx.uri,
+            }
         self.backends: Dict[str, TxBackend] = {
-            "info": self._make_backend(devices.info_tx, "info"),
-            "jammer": self._make_backend(devices.jammer_tx, "jammer"),
+            "info": self._make_backend("info"),
+            "jammer": self._make_backend("jammer"),
         }
-        self._log(f"初始化完成：模式={devices.mode}，赛季={season.season}")
+        self._log(
+            f"初始化完成：模式={self._current_mode_locked()}，赛季={season.season}，"
+            f"发现 Pluto 设备 {len(self._discovered_devices)} 台"
+        )
 
     # ==================== 内部工具 ====================
 
     def _log(self, msg: str) -> None:
         self._logs.appendleft(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
-    def _make_backend(self, dev: DeviceConfig, wave: str) -> TxBackend:
-        if self.devices.mode == "pluto":
-            return PlutoTx(dev.uri, underflow_gap_ms=self.devices.underflow_gap_ms)
+    def _read_devices(self) -> List[DiscoveredDevice]:
+        """执行设备扫描；扫描异常按无设备处理，不能阻断仿真启动。"""
+        try:
+            return list(self._device_scanner())
+        except Exception:
+            return []
+
+    def _current_mode_locked(self) -> str:
+        """只要任一波源绑定了真机就按真机模式展示，未绑定的波源单独标注虚拟。"""
+        return "pluto" if any(self._assignments.values()) else "sim"
+
+    def _model_for_uri_locked(self, uri: str) -> str:
+        for dev in self._discovered_devices:
+            if dev.uri == uri:
+                return dev.model
+        return "PlutoSDR"
+
+    def _devices_snapshot_locked(self) -> List[dict]:
+        role_by_uri = {uri: wave for wave, uri in self._assignments.items() if uri}
+        rows: List[dict] = []
+        seen = set()
+        for dev in self._discovered_devices:
+            rows.append({
+                "uri": dev.uri,
+                "model": dev.model,
+                "serial": dev.serial,
+                "description": dev.description,
+                "role": role_by_uri.get(dev.uri),
+                "source": "scan",
+            })
+            seen.add(dev.uri)
+        # 配置文件绑定但本次扫描未出现的设备仍然展示，避免"已绑定却看不到"
+        for wave, uri in self._assignments.items():
+            if uri and uri not in seen:
+                rows.append({
+                    "uri": uri,
+                    "model": "PlutoSDR",
+                    "serial": "",
+                    "description": "config/devices.yaml",
+                    "role": wave,
+                    "source": "config",
+                })
+        return rows
+
+    def _role_snapshot_locked(self, wave: str) -> dict:
+        uri = self._assignments[wave]
+        if not uri:
+            return {"uri": None, "model": "虚拟 SDR", "virtual": True}
+        return {"uri": uri, "model": self._model_for_uri_locked(uri), "virtual": False}
+
+    def _make_backend(self, wave: str) -> TxBackend:
+        uri = self._assignments.get(wave)
+        if uri:
+            return PlutoTx(uri, underflow_gap_ms=self.devices.underflow_gap_ms)
 
         def on_iq(iq: np.ndarray, wave: str = wave) -> None:
             # 回环解调放到独立线程：单周期解码约 15ms，若留在发射线程会挤占节拍，
@@ -432,6 +500,62 @@ class TxService:
         with self._lock:
             self.attenuation[wave] = float(attenuation_db)
 
+    def scan_devices(self) -> List[dict]:
+        """重新扫描 PlutoSDR，返回设备列表（含当前角色绑定）。"""
+        devices = self._read_devices()
+        with self._lock:
+            self._discovered_devices = devices
+            rows = self._devices_snapshot_locked()
+        self._log(f"设备扫描完成：发现 {len(devices)} 台 PlutoSDR")
+        return rows
+
+    def set_device_role(self, uri: str, role: Optional[str]) -> None:
+        """把扫描到的设备分配给信息波/干扰波，或取消分配。
+
+        同一波源只允许绑定一台设备；切换会重建对应后端。发射线程仍在运行时
+        禁止换绑，否则会关闭正在推流的设备，导致线程访问已释放的 SDR。
+        """
+        role = role or None
+        if role not in (None, "info", "jammer"):
+            raise ValueError("设备角色必须为 info / jammer / 空")
+        with self._lock:
+            assigned_by_uri = {u: w for w, u in self._assignments.items() if u}
+            known = {dev.uri for dev in self._discovered_devices}
+            # 允许操作配置文件绑定但本次扫描未出现的设备（例如临时离线）
+            if uri not in known and uri not in assigned_by_uri:
+                raise ValueError("设备不在扫描列表中，请重新扫描")
+            current = assigned_by_uri.get(uri)
+            if current == role:
+                return
+            affected = {wave for wave in (current, role) if wave}
+            for wave in affected:
+                running = self.info_running if wave == "info" else self.jammer_running
+                thread = self._threads.get(wave)
+                if running or (thread is not None and thread.is_alive()):
+                    name = "信息波" if wave == "info" else "干扰波"
+                    raise ValueError(f"{name}正在发射或收尾，请先停止后再切换设备")
+
+            if role:
+                old_uri = self._assignments[role]
+                if old_uri and old_uri != uri:
+                    self._assignments[role] = None
+            if current:
+                self._assignments[current] = None
+            if role:
+                self._assignments[role] = uri
+
+            # 受影响波源统一重建后端：解除绑定的回到虚拟 SDR，绑定真机的切到 Pluto
+            for wave in affected:
+                self.backends[wave].close()
+                self.backends[wave] = self._make_backend(wave)
+
+            model = self._model_for_uri_locked(uri)
+            if role is None:
+                self._log(f"设备 {model}（{uri}）已取消分配")
+            else:
+                name = "信息波" if role == "info" else "干扰波"
+                self._log(f"设备 {model}（{uri}）已分配为{name}发射")
+
     def shutdown(self) -> None:
         self._stop.set()
         with self._lock:
@@ -464,7 +588,9 @@ class TxService:
             jam_freq, jam_bw, jam_power = self._rf_params("jammer")
             return {
                 "season": self.season.season,
-                "mode": self.devices.mode,
+                "mode": self._current_mode_locked(),
+                "devices": self._devices_snapshot_locked(),
+                "device_roles": {wave: self._role_snapshot_locked(wave) for wave in ("info", "jammer")},
                 "rules": self._rules_snapshot(),
                 "team": self.team,
                 "safety_confirmed": self.safety_confirmed,

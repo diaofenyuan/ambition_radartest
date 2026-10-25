@@ -13,13 +13,17 @@ import time
 import pytest
 
 from radar_tx.config import load_devices_config, load_season_config
+from radar_tx.device.discovery import DiscoveredDevice, scan_pluto_devices
+from radar_tx.device.pluto_tx import PlutoTx
+from radar_tx.device.virtual_sdr import VirtualSdr
 from radar_tx.protocol.serial_frame import CMD_ROBOT_POSITION, SerialFrameBuilder
 from radar_tx.scheduler.tx_service import TxService
 
 
 @pytest.fixture
 def service():
-    svc = TxService(load_season_config(), load_devices_config())
+    # 测试不扫描真实硬件，避免本机 USB 设备影响状态断言
+    svc = TxService(load_season_config(), load_devices_config(), device_scanner=lambda: [])
     yield svc
     svc.shutdown()
 
@@ -91,4 +95,67 @@ def test_mute_pulls_attenuation_to_max_despite_inflight_cycle(service):
         assert snap["info"]["running"] is False
         assert snap["info"]["stats"]["attenuation_db"] == 89.0, "MUTE 衰减被在途周期覆盖"
     service.stop("info")
+
+
+DEVICE = DiscoveredDevice(
+    uri="usb:1.6.5",
+    description="0456:b673 (Analog Devices Inc. PlutoSDR (ADALM-PLUTO)), serial=03df62",
+    serial="03df62",
+    model="PlutoSDR",
+)
+
+
+def test_scan_dedupes_same_board_and_ignores_non_pluto(monkeypatch):
+    pytest.importorskip("iio")
+    import iio
+
+    contexts = {
+        "usb:1.6.5": "0456:b673 (Analog Devices Inc. PlutoSDR (ADALM-PLUTO)), serial=03df62",
+        "ip:pluto.local": "fe80::1 (Analog Devices PlutoSDR Rev.B), serial=03df62",
+        "ip:other.local": "192.168.1.9 (Some Other IIO Device), serial=other",
+    }
+    monkeypatch.setattr(iio, "scan_contexts", lambda: contexts)
+    devices = scan_pluto_devices()
+    assert len(devices) == 1
+    assert devices[0].uri == "usb:1.6.5"  # 同一块板优先保留 USB
+    assert devices[0].serial == "03df62"
+
+
+def test_device_role_switch_rebuilds_backend():
+    svc = TxService(load_season_config(), load_devices_config(), device_scanner=lambda: [DEVICE])
+    try:
+        with pytest.raises(ValueError):
+            svc.set_device_role("usb:999", "info")  # 未扫描到的设备不允许直接绑定
+        assert isinstance(svc.backends["info"], VirtualSdr)
+        svc.set_device_role(DEVICE.uri, "info")
+        assert isinstance(svc.backends["info"], PlutoTx)
+        assert isinstance(svc.backends["jammer"], VirtualSdr)
+        snap = svc.snapshot()
+        assert snap["mode"] == "pluto"
+        assert snap["device_roles"]["info"]["uri"] == DEVICE.uri
+        assert snap["devices"][0]["role"] == "info"
+
+        # 同一块板改绑到干扰波，信息波必须回到虚拟后端
+        svc.set_device_role(DEVICE.uri, "jammer")
+        assert isinstance(svc.backends["info"], VirtualSdr)
+        assert isinstance(svc.backends["jammer"], PlutoTx)
+        assert svc.snapshot()["devices"][0]["role"] == "jammer"
+
+        svc.set_device_role(DEVICE.uri, None)
+        assert isinstance(svc.backends["jammer"], VirtualSdr)
+        assert svc.snapshot()["mode"] == "sim"
+    finally:
+        svc.shutdown()
+
+
+def test_device_role_switch_rejected_while_running():
+    svc = TxService(load_season_config(), load_devices_config(), device_scanner=lambda: [DEVICE])
+    try:
+        svc.set_safety(True)
+        svc.start("info")
+        with pytest.raises(ValueError):
+            svc.set_device_role(DEVICE.uri, "info")
+        svc.stop("info")
+    finally:
+        svc.shutdown()
 

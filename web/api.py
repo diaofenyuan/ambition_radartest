@@ -51,6 +51,11 @@ class AttenuationBody(BaseModel):
     attenuation_db: float
 
 
+class DeviceRoleBody(BaseModel):
+    uri: str = Field(..., min_length=1, max_length=256)
+    role: str | None = None
+
+
 def create_app(service: TxService, on_ui_closed: Callable[[], None] | None = None) -> FastAPI:
     sessions = UiSessions()
 
@@ -100,6 +105,15 @@ def create_app(service: TxService, on_ui_closed: Callable[[], None] | None = Non
     @app.post("/api/ui/{session_id}/close")
     async def close_ui(session_id: str):
         sessions.discard(session_id, closed=True)
+        return {"ok": True}
+
+    @app.post("/api/devices/scan")
+    def devices_scan():
+        return {"devices": service.scan_devices()}
+
+    @app.post("/api/devices/assign")
+    def devices_assign(body: DeviceRoleBody):
+        _call(service.set_device_role, body.uri, body.role)
         return {"ok": True}
 
     @app.post("/api/safety")
