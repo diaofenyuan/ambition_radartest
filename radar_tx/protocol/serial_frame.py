@@ -22,7 +22,7 @@ CMD_ROBOT_POSITION = 0x0A01  # 敌方 6 台机器人坐标，12 × int16（x,y �
 CMD_ROBOT_HP = 0x0A02        # 6 台机器人血量，6 × uint16
 CMD_ROBOT_AMMO = 0x0A03      # 允许发弹量等，5 × uint16
 CMD_FIELD_STATUS = 0x0A04    # 场地状态：剩余金币、总金币、状态标志
-CMD_ROBOT_BUFF = 0x0A05      # 增益与哨兵姿态，36 或 41 字节
+CMD_ROBOT_BUFF = 0x0A05      # 增益与哨兵姿态，固定 41 字节（表 1-48）
 CMD_INTERFERENCE_KEY = 0x0A06  # 干扰密钥，6 字节 ASCII
 
 ALL_CMDS = (
@@ -96,9 +96,14 @@ class SerialFrameBuilder:
             raise ValueError("0x0A05 载荷必须为 41 字节")
         return self.pack(CMD_ROBOT_BUFF, payload)
 
-    def pack_key(self, key_text: str) -> bytes:
-        """干扰密钥固定 6 字节 ASCII，不足右侧补字符 '0'。"""
-        raw = key_text[:6].encode("ascii", errors="ignore").ljust(6, b"0")
+    def pack_key(self, key_text: str, pad_char: str = "0") -> bytes:
+        """干扰密钥固定 6 字节 ASCII（表 1-49），不足右侧补 pad_char。
+
+        补位只是兜底：正常路径上密钥在状态层就已补齐到 6 位，
+        这样界面显示的串与真正发出去的那 6 个字节才是同一个东西。
+        """
+        pad = (pad_char or "0")[:1].encode("ascii") or b"0"
+        raw = key_text[:6].encode("ascii", errors="ignore").ljust(6, pad)
         return self.pack(CMD_INTERFERENCE_KEY, raw)
 
 

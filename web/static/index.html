@@ -303,13 +303,15 @@ function renderCommands(cmds) {
 // ---- Pluto 设备列表：按 URI 增量更新，避免 0.5s 推送覆盖正在操作的下拉框 ----
 const devRefs = new Map();
 let devOrder = "";
+// 后端给的空列表原因（缺 libiio 原生库 / 板子未枚举）；有设备时为空
+let devNote = "";
 
 function buildDevices(devices) {
   const box = $("devList");
   box.innerHTML = "";
   devRefs.clear();
   if (!devices.length) {
-    box.innerHTML = '<div class="empty">未发现 Pluto 设备，请检查 USB 连接/驱动后点「重新扫描」。</div>';
+    box.innerHTML = `<div class="empty">${esc(devNote || "未发现 Pluto 设备，请检查 USB 连接/驱动后点「重新扫描」。")}</div>`;
     return;
   }
   for (const d of devices) {
@@ -332,8 +334,10 @@ function buildDevices(devices) {
   }
 }
 
-function renderDevices(devices) {
-  const order = devices.map(d => d.uri + "|" + (d.source || "")).join(",");
+function renderDevices(devices, note) {
+  devNote = note || "";
+  // 原因也要参与比较：空列表时列表内容不变，但提示语可能从"缺 DLL"变成"无设备"
+  const order = devices.map(d => d.uri + "|" + (d.source || "")).join(",") + "#" + devNote;
   if (order !== devOrder) { buildDevices(devices); devOrder = order; }
   $("devCount").textContent = devices.length + " 台";
   for (const d of devices) {
@@ -430,7 +434,7 @@ function render(s) {
   $("modeBadge").className = "badge" + (s.mode === "pluto" ? " red" : "");
   $("infoDev").textContent = fmtRoleDevice((s.device_roles || {}).info);
   $("jamDev").textContent = fmtRoleDevice((s.device_roles || {}).jammer);
-  renderDevices(s.devices || []);
+  renderDevices(s.devices || [], s.device_note);
 
   if (first) {
     $("teamSel").value = s.team;

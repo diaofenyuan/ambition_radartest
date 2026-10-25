@@ -109,7 +109,8 @@ def create_app(service: TxService, on_ui_closed: Callable[[], None] | None = Non
 
     @app.post("/api/devices/scan")
     def devices_scan():
-        return {"devices": service.scan_devices()}
+        # note 在扫不到设备时说明原因（缺原生库 / 板子未枚举），空字符串表示正常
+        return {"devices": service.scan_devices(), "note": service.device_note()}
 
     @app.post("/api/devices/assign")
     def devices_assign(body: DeviceRoleBody):

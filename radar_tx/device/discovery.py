@@ -12,6 +12,8 @@ import re
 from dataclasses import dataclass
 from typing import Dict
 
+from .libiio_runtime import ensure_libiio_available
+
 _SERIAL_RE = re.compile(r"serial=([0-9A-Za-z]+)")
 
 
@@ -49,12 +51,15 @@ def _model_name(description: str) -> str:
 
 def scan_pluto_devices() -> list[DiscoveredDevice]:
     """扫描当前主机可见的 PlutoSDR；无依赖或扫描失败时返回空列表。"""
+    # 必须在 import iio 之前把原生库目录挂进 PATH，否则 find_library 找不到
+    # libiio.dll，导入阶段直接抛 TypeError。
+    libiio_ok, _ = ensure_libiio_available()
+    if not libiio_ok:
+        return []
     try:
         import iio  # 延迟导入：仿真环境无需安装 libiio 绑定
     except Exception:
-        # 仅装了 pylibiio 纯 Python 绑定、机器上没有 libiio 原生库时，
-        # import 阶段抛的是 OSError/TypeError 而不是 ImportError。
-        # 仿真模式必须容忍这种环境，按"无设备"处理。
+        # 兜底：原生库存在但依赖 DLL 缺失时，导入仍可能抛非 ImportError。
         return []
     try:
         contexts = iio.scan_contexts() or {}

@@ -16,7 +16,9 @@ air_protocol:
   access_code_interfere: "16E8D377151C712D"
   header: "000F000F"
   payload_len: 15
-  packets_per_cycle: 9
+  # 每周期空口包数不写死：它由业务字节数决定，且信息波本就不整除——
+  # 140B/周期 ÷ 15B = 9.33 包，实测按 9/9/10 交替；干扰波 135B/周期恰好 9 包。
+  # 原 packets_per_cycle: 9 与信息波实际不符，也没有任何代码读取，故删除。
   cycles_per_sec: 10
 
 business:

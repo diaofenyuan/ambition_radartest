@@ -21,16 +21,20 @@ DEVICES_PATH = ROOT / "config" / "devices.yaml"
 
 @dataclass(frozen=True)
 class RfProfile:
-    """单条射频配置（频点/带宽/标称功率）。"""
+    """单条射频配置（频点/带宽/标称功率/码率）。"""
     freq_hz: int
     bandwidth_hz: int
     power_dbm: int
+    # 码率由 ModulationParams 决定（采样率 ÷ SPS），随赛季一起写在 YAML 里。
+    # 这里必须保存加载后的实参：早先版本直接读 ModulationParams 的类属性，
+    # 等于永远取 dataclass 默认值（1MS/s ÷ 47），改 YAML 换赛季后频偏不会跟随，
+    # 与"换赛季只换 YAML 不动代码"的设计目标相悖。
+    bit_rate_hz: float
 
     @property
     def freq_deviation_hz(self) -> float:
         """2-GFSK 频偏：带宽半宽减去码率，对齐规则表 5-23 的 sensitivity 推导。"""
-        bit_rate = ModulationParams.SAMPLE_RATE_HZ / ModulationParams.SAMPLES_PER_SYMBOL
-        return self.bandwidth_hz / 2 - bit_rate
+        return self.bandwidth_hz / 2 - self.bit_rate_hz
 
 
 @dataclass(frozen=True)
@@ -52,7 +56,6 @@ class SeasonConfig:
     modulation: ModulationParams
     access_code_info: bytes
     access_code_interfere: bytes
-    packets_per_cycle: int
     cycles_per_sec: int
     key_len: int
     key_pad_char: str
@@ -85,6 +88,7 @@ def load_season_config(path: Path = RF_PROFILES_PATH) -> SeasonConfig:
                 freq_hz=int(spec["freq_hz"]),
                 bandwidth_hz=int(spec["bandwidth_hz"]),
                 power_dbm=int(spec["power_dbm"]),
+                bit_rate_hz=modulation.bit_rate_hz,
             )
             for wave, spec in waves.items()
         }
@@ -93,7 +97,6 @@ def load_season_config(path: Path = RF_PROFILES_PATH) -> SeasonConfig:
         modulation=modulation,
         access_code_info=bytes.fromhex(air["access_code_info"]),
         access_code_interfere=bytes.fromhex(air["access_code_interfere"]),
-        packets_per_cycle=int(air["packets_per_cycle"]),
         cycles_per_sec=int(air["cycles_per_sec"]),
         key_len=int(biz["key_len_ascii"]),
         key_pad_char=str(biz["key_pad_char"]),

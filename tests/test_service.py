@@ -8,6 +8,7 @@
 - 停发后立刻再开不得残留旧发射线程（双线程并发推流）。
 """
 
+import struct
 import time
 
 import numpy as np
@@ -17,7 +18,10 @@ from radar_tx.config import load_devices_config, load_season_config
 from radar_tx.device.discovery import DiscoveredDevice, scan_pluto_devices
 from radar_tx.device.pluto_tx import PlutoTx
 from radar_tx.device.virtual_sdr import VirtualSdr
-from radar_tx.protocol.serial_frame import CMD_ROBOT_POSITION, SerialFrameBuilder
+from radar_tx.protocol.serial_frame import (
+    CMD_FIELD_STATUS, CMD_INTERFERENCE_KEY, CMD_ROBOT_BUFF, CMD_ROBOT_POSITION,
+    SerialFrameBuilder, SerialFrameDecoder,
+)
 from radar_tx.scheduler.tx_service import TxService
 
 
@@ -69,6 +73,36 @@ def test_info_stream_keeps_140_bytes_without_auto_vary(service):
     service.set_auto_vary(False)
     stream = service._build_info_stream(SerialFrameBuilder())
     assert len(stream) == 140
+
+
+def test_buff_tail_fields_are_legal_enums(service):
+    # 表 1-48：尾部 6B 是枚举而不是自由数据——哨兵姿态 1~6、各机器人主要状态 0~3。
+    # 早先这里填 os.urandom(6)，约 97% 的帧会带上不存在的姿态值。
+    for _ in range(200):
+        payload = service._gen_payload(CMD_ROBOT_BUFF)
+        assert len(payload) == 41
+        assert 1 <= payload[35] <= 6, f"哨兵姿态越界：{payload[35]}"
+        assert all(0 <= v <= 3 for v in payload[36:]), f"状态枚举越界：{payload[36:].hex()}"
+
+
+def test_field_status_flags_respect_bitfield_ranges(service):
+    # 表 1-47：中央高地与前哨站都是 0/1/2 的三值枚举，随机取 0~7 会造出非法的 3
+    for _ in range(200):
+        flags = struct.unpack_from("<I", service._gen_payload(CMD_FIELD_STATUS), 4)[0]
+        assert (flags >> 1) & 0x3 <= 2, "中央高地占位值越界"
+        assert (flags >> 6) & 0x3 <= 2, "前哨站占位值越界"
+        assert flags >> 16 == 0, "表 1-47 只定义到 bit15"
+
+
+def test_short_key_pads_ui_and_wire_consistently(service):
+    # 规则要求恰好 6 位。补位若只发生在帧层，界面显示 "AB1"、空口却发 "AB1000"，
+    # 两边不一致；现在补位在状态层完成，快照即实发内容。
+    service.set_jammer(key="AB1")
+    assert service.snapshot()["key"] == "AB1000"
+    stream = service._build_jammer_stream(SerialFrameBuilder(), 0)
+    keys = [f.payload for f in SerialFrameDecoder().feed(stream)
+            if f.cmd_id == CMD_INTERFERENCE_KEY]
+    assert keys == [b"AB1000"]
 
 
 def test_rapid_restart_leaves_no_stale_tx_thread(service):

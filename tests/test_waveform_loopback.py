@@ -11,7 +11,7 @@ import os
 
 import pytest
 
-from radar_tx.config import load_season_config
+from radar_tx.config import ModulationParams, RfProfile, load_season_config
 from radar_tx.protocol.air_frame import ACCESS_CODE_INTERFERE, AirStreamChunker
 from radar_tx.protocol.serial_frame import (
     CMD_FIELD_STATUS, CMD_INTERFERENCE_KEY, CMD_ROBOT_AMMO, CMD_ROBOT_BUFF,
@@ -52,6 +52,20 @@ def test_modulation_params_match_rule():
     # 附录 1：红方广播源 bit=1 瞬时频偏 +248,723Hz
     dev = SEASON.profile("red", "info").freq_deviation_hz
     assert round(dev) == 248_723
+
+
+def test_freq_deviation_follows_loaded_symbol_rate():
+    """频偏必须由加载后的码率推导，而不是 ModulationParams 的类默认值。
+
+    早先 freq_deviation_hz 直接读类属性，等价于永远按 1MS/s ÷ 47 计算：
+    换赛季把 YAML 的 SPS 或采样率改掉后，频偏会静默偏离规则公式，
+    而 config.py 的设计目标恰恰是"换赛季只换 YAML"。
+    """
+    mod = ModulationParams(SAMPLE_RATE_HZ=1_000_000, SAMPLES_PER_SYMBOL=50)
+    profile = RfProfile(freq_hz=433_200_000, bandwidth_hz=540_000, power_dbm=-60,
+                        bit_rate_hz=mod.bit_rate_hz)
+    # Δf = 270000 - 20000
+    assert round(profile.freq_deviation_hz) == 250_000
 
 
 @pytest.mark.parametrize("team", ["red", "blue"])

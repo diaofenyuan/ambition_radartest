@@ -33,30 +33,83 @@ def gaussian_taps(mod: ModulationParams) -> np.ndarray:
 
 
 class GfskModulator:
-    """字节流 → 复数基带 IQ。"""
+    """字节流 → 复数基带 IQ。
+
+    规则附录 1 规定空口包之间没有保护间隔（"数据到达即发射"），所以发射线程
+    必须按**连续流**调制：滤波器尾样本与相位跨数据块保留。若逐包独立调制再首尾
+    相接，每个包边界相位归零，瞬时频偏会出现越过 ±Δf 的跳变，且每包首尾各一个
+    符号的频偏只有设定值的一半。
+    """
 
     def __init__(self, mod: ModulationParams, profile: RfProfile, amplitude: float = 0.5) -> None:
         self.mod = mod
         self.profile = profile
         self.amplitude = amplitude
         self._taps = gaussian_taps(mod)
+        # 群延迟补偿：滤波器线性相位延迟为 (ntaps-1)/2 个采样
+        self._delay = (len(self._taps) - 1) // 2
+        self._phase_inc = 2 * math.pi * profile.freq_deviation_hz / mod.SAMPLE_RATE_HZ
+        self.reset()
+
+    def reset(self) -> None:
+        """丢弃跨块状态。
+
+        发射中断期间射频是静的，把上一轮残留的相位与滤波器历史接到新一轮开头，
+        会凭空造出一个本不存在的相位跳变，因此每次重新开始发射都要清一次。
+        """
+        self._history = np.zeros(self._delay, dtype=np.float64)
+        self._phase = 0.0
 
     def modulate_bytes(self, data: bytes) -> np.ndarray:
-        bits = np.frombuffer(np.unpackbits(np.frombuffer(data, dtype=np.uint8)), dtype=np.uint8)
+        """整块调制，不读写跨块状态（单包波形、离线分析用）。"""
+        bits = np.unpackbits(np.frombuffer(data, dtype=np.uint8))
         return self.modulate_bits(bits)
 
     def modulate_bits(self, bits: np.ndarray) -> np.ndarray:
+        """同 modulate_bytes，输入为比特序列；始终从零相位、零历史开始。"""
+        return self._emit(np.asarray(bits, dtype=np.uint8), self._fresh_history(), advance=False)
+
+    def modulate_stream(self, data: bytes) -> np.ndarray:
+        """连续流调制：保留滤波器尾样本与相位，允许跨调用首尾相接。"""
+        if len(data) == 0:
+            return np.zeros(0, dtype=np.complex64)
+        bits = np.unpackbits(np.frombuffer(data, dtype=np.uint8))
+        return self._emit(bits, self._history, advance=True)
+
+    def _fresh_history(self) -> np.ndarray:
+        return np.zeros(self._delay, dtype=np.float64)
+
+    def _emit(self, bits: np.ndarray, history: np.ndarray, advance: bool) -> np.ndarray:
+        """比特 → 成形频偏 → 相位积分 → IQ。
+
+        history 为上一块末尾 delay 个 NRZ 样点；advance=True 时把本轮末尾的
+        NRZ 与累积相位写回实例，使下一块能从同一个相位继续，而不是把相位归零。
+        """
+        if len(bits) == 0:
+            return np.zeros(0, dtype=np.complex64)
         sps = self.mod.SAMPLES_PER_SYMBOL
         # NRZ 矩形脉冲：每个符号占 sps 个采样
         nrz = np.repeat(bits.astype(np.float64) * 2.0 - 1.0, sps)
-        shaped = np.convolve(nrz, self._taps, mode="full")
-        # 群延迟补偿：滤波器线性相位延迟为 (ntaps-1)/2 个采样
-        delay = (len(self._taps) - 1) // 2
-        shaped = shaped[delay : delay + len(nrz)]
-        # 瞬时频率 → 相位积分 → IQ
-        phase_inc = 2 * math.pi * self.profile.freq_deviation_hz / self.mod.SAMPLE_RATE_HZ
-        phase = np.cumsum(shaped * phase_inc)
+        # 前缀 history 让块首的滤波窗口能看到上一块的末尾符号，后缀补零同理收尾。
+        # 卷积本身有 delay 个采样的群延迟，加上前缀的 delay，有效区从 2*delay 起。
+        padded = np.concatenate((history, nrz, np.zeros(self._delay)))
+        start = 2 * self._delay
+        shaped = np.convolve(padded, self._taps, mode="full")[start : start + len(nrz)]
+        base = self._phase if advance else 0.0
+        phase = base + np.cumsum(shaped * self._phase_inc)
+        if advance:
+            self._history = self._tail(nrz)
+            # 相位按 2π 取模：累积到 1e9 弧度后 float64 的样点内精度会退化
+            self._phase = float(phase[-1]) % (2 * math.pi)
         return (self.amplitude * np.exp(1j * phase)).astype(np.complex64)
+
+    def _tail(self, nrz: np.ndarray) -> np.ndarray:
+        """取块末 delay 个 NRZ 样点作为下一块的滤波历史；块比 delay 还短时左侧补零。"""
+        if self._delay == 0:
+            return self._history
+        if len(nrz) >= self._delay:
+            return nrz[-self._delay :].copy()
+        return np.concatenate((np.zeros(self._delay - len(nrz)), nrz))
 
 
 class GfskDemodulator:

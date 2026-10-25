@@ -26,6 +26,7 @@ import numpy as np
 from ..config import DevicesConfig, SeasonConfig
 from ..device.base import TxBackend
 from ..device.discovery import DiscoveredDevice, scan_pluto_devices
+from ..device.libiio_runtime import unavailable_reason as libiio_unavailable_reason
 from ..device.pluto_tx import PlutoTx
 from ..device.virtual_sdr import VirtualSdr
 from ..protocol.air_frame import AIR_PAYLOAD_LEN, AirStreamChunker
@@ -258,14 +259,28 @@ class TxService:
         if cmd_id == CMD_ROBOT_AMMO:
             return struct.pack("<5H", *(random.randint(0, 500) for _ in range(5)))
         if cmd_id == CMD_FIELD_STATUS:
-            return struct.pack("<HHI", random.randint(0, 2000), 2000, random.randint(0, 7))
+            # 4 字节状态字按表 1-47 的位域逐段拼装。中央高地、堡垒、前哨站都是多值
+            # 枚举，直接塞 0~7 的随机数会造出"3"这种非法占位（中央高地只有 0/1/2）。
+            flags = (
+                random.randint(0, 1)               # bit0 补给区占领
+                | random.randint(0, 2) << 1        # bit1-2 中央高地（1 对方 / 2 己方）
+                | random.randint(0, 1) << 3        # bit3 梯形高地
+                | random.randint(0, 3) << 4        # bit4-5 堡垒增益点
+                | random.randint(0, 2) << 6        # bit6-7 前哨站增益点
+                | random.randint(0, 1) << 8        # bit8 基地增益点
+                | random.randint(0, 0x7F) << 9     # bit9-15 场地交互模块卡状态位
+            )
+            return struct.pack("<HHI", random.randint(0, 2000), 2000, flags)
         if cmd_id == CMD_ROBOT_BUFF:
             # 5 台机器人 × 7B 增益（回血1+冷却2+防御1+负防御1+攻击2）+ 6B 尾部，共 41B
             buf = bytearray()
             for _ in range(5):
                 buf += struct.pack("<BHBBH", random.randint(0, 100), random.randint(0, 50),
                                    random.randint(0, 100), random.randint(0, 100), random.randint(0, 100))
-            buf += os.urandom(6)
+            # 尾部 6B 是枚举而非自由数据：哨兵姿态 1~6，5 台机器人主要状态 0~3。
+            # 用随机字节会让 97% 的帧带上不存在的姿态值，接收端只要校验就整帧丢掉。
+            buf.append(random.randint(1, 6))                      # 哨兵当前姿态
+            buf += bytes(random.randint(0, 3) for _ in range(5))  # 英雄/工程/3步/4步/哨兵状态
             return bytes(buf)
         if cmd_id == CMD_INTERFERENCE_KEY:
             return self._random_key()
@@ -307,6 +322,9 @@ class TxService:
                 packets = chunker.feed(stream)
                 iq = modulate_air_packets(packets, self._modulator(wave))
                 if len(iq) < cycle_samples:
+                    # 补零只代表设备端本周期静默，字节流本身没有断。
+                    # 调制器状态故意不在这里复位：复位会让下一周期首个符号从半频偏起步，
+                    # 而接收端做的是跨周期连续的符号定时。
                     iq = np.pad(iq, (0, cycle_samples - len(iq)))
                 backend = self.backends[wave]
                 # 衰减下发必须与 MUTE 的"衰减拉满"在同一把锁内，且下发前重新校验 run_id：
@@ -364,7 +382,7 @@ class TxService:
         """
         with self._lock:
             key = self.key
-        key_frame = builder.pack_key(key)  # 恰好 15B = 1 个空口包载荷
+        key_frame = builder.pack_key(key, self.season.key_pad_char)  # 恰好 15B = 1 个空口包载荷
         total = self.season.jammer_bytes_per_cycle
         offset = (cycle_index * 7) % AIR_PAYLOAD_LEN
         return os.urandom(offset) + key_frame + os.urandom(total - offset - len(key_frame))
@@ -392,6 +410,9 @@ class TxService:
             # 换发新的 run_id，令任何仍在收尾的旧线程失效
             self._run_ids[wave] += 1
             run_id = self._run_ids[wave]
+            # 新一轮从零相位、零滤波历史起步：中断期间射频是静的，
+            # 若接着上一轮残留的相位发，开头会凭空多出一个相位跳变。
+            self._modulator(wave).reset()
         thread = threading.Thread(target=self._engine_loop, args=(wave, run_id),
                                   daemon=True, name=f"tx-{wave}")
         self._threads[wave] = thread
@@ -490,12 +511,14 @@ class TxService:
                     # 规则：干扰波难度变化时密钥重置为随机值
                     self.key = self._random_key().decode("ascii")
             if key is not None:
-                raw = key.encode("ascii", errors="ignore")
+                raw = key.encode("ascii", errors="ignore").decode("ascii")
                 if len(raw) > self.season.key_len:
                     raise ValueError(f"密钥最长 {self.season.key_len} 个 ASCII 字符")
-                if not raw.decode("ascii").isalnum():
+                if not raw.isalnum():
                     raise ValueError("密钥必须为数字字母组合")
-                self.key = raw.decode("ascii")
+                # 补位必须落在这里而不是帧层：否则界面显示用户输入的短串、
+                # 空口发出的却是补过位的 6 字节，两边对不上（规则要求恰好 6 位）。
+                self.key = raw.ljust(self.season.key_len, self.season.key_pad_char)
         self._log(f"干扰参数：等级 {self.jammer_level}，密钥 {self.key}")
 
     def set_attenuation(self, wave: str, attenuation_db: float) -> None:
@@ -504,6 +527,17 @@ class TxService:
             raise ValueError("衰减超出允许范围")
         with self._lock:
             self.attenuation[wave] = float(attenuation_db)
+
+    def device_note(self) -> str:
+        """扫描为空时给出可读原因。
+
+        "扫描不到设备"有两种完全不同的成因：缺 libiio 原生库（软件问题）
+        与板子没枚举上来（连接问题）。界面必须能区分，否则只会显示
+        "未发现 Pluto 设备"，让人误以为板子坏了。
+        """
+        if self._discovered_devices:
+            return ""
+        return libiio_unavailable_reason()
 
     def scan_devices(self) -> List[dict]:
         """重新扫描 PlutoSDR，返回设备列表（含当前角色绑定）。"""
@@ -595,6 +629,7 @@ class TxService:
                 "season": self.season.season,
                 "mode": self._current_mode_locked(),
                 "devices": self._devices_snapshot_locked(),
+                "device_note": self.device_note(),
                 "device_roles": {wave: self._role_snapshot_locked(wave) for wave in ("info", "jammer")},
                 "rules": self._rules_snapshot(),
                 "team": self.team,

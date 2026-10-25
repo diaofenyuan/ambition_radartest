@@ -30,6 +30,12 @@ class PlutoTx(TxBackend):
     def _ensure_device(self):
         if self._sdr is not None:
             return self._sdr
+        # 真机模式必须先定位 libiio 原生库：缺失时给出可读原因，
+        # 而不是让 pylibiio 在导入阶段抛一句 TypeError。
+        from .libiio_runtime import ensure_libiio_available
+        libiio_ok, detail = ensure_libiio_available()
+        if not libiio_ok:
+            raise RuntimeError(detail)
         import adi  # 延迟导入：仿真模式不需要该依赖
         sdr = adi.Pluto(self._uri)
         sdr.tx_cyclic_buffer = False
