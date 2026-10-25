@@ -103,24 +103,41 @@ def run(args) -> None:
     sdr = _open(args.uri)
     sdr.sample_rate = int(fs)
     sdr.rx_lo = int(profile.freq_hz + args.offset)
-    sdr.rx_rf_bandwidth = int(profile.bandwidth_hz)
+    # RX 的 RF 带宽以本振为中心。把本振挪开 offset 之后，通带必须仍然覆盖
+    # 「信号中心 ± 信号带宽/2」，否则 2-GFSK 的边带会被模拟滤波器直接切掉——
+    # 本振偏 300 kHz 却只开 540 kHz 带宽时，信号中心正好落在通带边缘外。
+    rx_bw = int(max(profile.bandwidth_hz,
+                    2 * (abs(args.offset) + profile.bandwidth_hz / 2)))
+    sdr.rx_rf_bandwidth = rx_bw
     sdr.gain_control_mode_chan0 = "manual"
     sdr.rx_hardwaregain_chan0 = float(args.gain)
     sdr.rx_buffer_size = 200_000
     print(f"  本振 {sdr.rx_lo / 1e6:.3f} MHz（相对信号 {args.offset / 1e3:+.0f} kHz）"
           f"  带宽 {sdr.rx_rf_bandwidth / 1e3:.0f} kHz  增益 {sdr.rx_hardwaregain_chan0:.0f} dB")
+    rch = list(getattr(sdr, "rx_enabled_channels", []) or [])
+    rnames = list(getattr(sdr, "rx_channel_names", []) or [])
+    print(f"  RX 通道 {[rnames[i] for i in rch] if rnames else rch}"
+          f"（voltage0=RX1A，接错口收不到）")
     print(f"  等信号中，{args.seconds:.0f} 秒内任何时刻发射板发波都能收到…")
 
     decoder = SerialFrameDecoder()
     total_payloads, frames, cycles = 0, [], 0
     end = time.monotonic() + args.seconds
-    peak_rms = 0.0
+    peak_rms = peak_sig = 0.0
     while time.monotonic() < end:
         iq = np.array(sdr.rx(), copy=True)
+        # pyadi 的 rx() 在不同版本/固件下可能给归一化到 ±1 的浮点，也可能给原始
+        # int16 计数（满量程 ±32768，噪声底只有 ~0.6）。按"值是否为整数"判断：
+        # 用幅度阈值判断会失灵——低增益时峰值只有 2~5，照样是原始计数。
+        scale = 32768.0 if np.abs(iq - np.round(iq)).max() < 1e-9 else 1.0
+        iq = (iq / scale).astype(np.complex64)
         cycles += 1
         rms = float(np.sqrt(np.mean(np.abs(iq) ** 2)))
         peak_rms = max(peak_rms, rms)
         x = shift_to_baseband(iq, args.offset, fs)
+        # 去直流后的幅度才是"信号有多强"：零中频接收机的原始 RMS 里，
+        # 自身 LO 泄漏和直流失调往往占掉大半，容易误判成"收到了信号"。
+        peak_sig = max(peak_sig, float(np.sqrt(np.mean(np.abs(x) ** 2))))
         bits, off, cfo, detects = demodulate(x.astype(np.complex64), sps, code_bits)
         if bits is None or detects == 0:
             continue
@@ -135,12 +152,16 @@ def run(args) -> None:
 
     print()
     if not frames:
-        print(f"[FAIL] 没解出业务帧。峰值 RMS {peak_rms:.5f}")
-        if peak_rms < 1e-4:
-            print("   → 根本没收到信号：检查发射板是否在发、天线、本振是否对准、增益是否太低")
+        print(f"[FAIL] 没解出业务帧。原始 RMS {peak_rms:.5f}，去直流后 {peak_sig:.5f}")
+        if peak_sig < 1e-3:
+            print("   → 去直流后几乎没能量：信号没进来。检查发射板是否在发、"
+                  "收发天线是否接在 TX1A / RX1A、本振是否对准")
+        elif peak_sig > 0.5:
+            print("   → 去直流后幅度仍接近满量程：接收机饱和。把 --gain 降到 0，"
+                  "或把发射侧 --gain（衰减）加大到 70~89")
         else:
-            print("   → 收到能量但解不出：多半是本振偏差过大或带宽设窄了，"
-                  "试 --offset 0 / --offset -600e3，或把 --gain 降到 20 再试")
+            print("   → 收到了像样的信号但解不出：试 --offset 0，或检查带宽是否覆盖"
+                  "「信号中心 ± 270 kHz」")
         return
     print(f"[OK] 解出 {len(frames)} 个业务帧：")
     for f in frames[:12]:
@@ -157,7 +178,8 @@ def main() -> None:
                    choices=["info", "jammer_1", "jammer_2", "jammer_3"])
     p.add_argument("--offset", type=float, default=-300e3,
                    help="RX 本振相对信号频点的偏移 Hz，默认 -300k（避开直流泄漏）")
-    p.add_argument("--gain", type=float, default=40, help="RX 硬件增益 dB，默认 40")
+    p.add_argument("--gain", type=float, default=40,
+                   help="RX 硬件增益 dB（-3~71），默认 40；信号弱就往 50~60 加")
     p.add_argument("--seconds", type=float, default=5, help="监听时长，默认 5 秒")
     p.add_argument("--stop-after", type=int, default=20, help="解出多少帧后提前结束")
     args = p.parse_args()
