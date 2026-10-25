@@ -52,6 +52,23 @@ def _open(uri: str):
     return sdr
 
 
+def count_access_hits(bits: np.ndarray, code_bits: np.ndarray, max_bit_errors: int = 2) -> int:
+    """统计比特流里 Access Code 的命中次数，逐位滑窗、不假设帧网格。
+
+    发射端每周期补零、跨周期切片，帧边界会落在任意比特位置上。按 216 bit
+    固定网格搜索时，只有"采集起点恰好对齐"的 1/216 情况能命中，其余时候
+    明明收到信号也会得到 detects=0，整段样本被丢弃。
+    """
+    n, code_len = len(bits), len(code_bits)
+    if n < code_len:
+        return 0
+    b = bits.astype(np.int8) * 2 - 1
+    c = code_bits.astype(np.int8) * 2 - 1
+    # 相关值 = 匹配位数 - 不匹配位数 = code_len - 2×错误位数
+    corr = np.convolve(b, c[::-1], mode="valid")
+    return int(np.count_nonzero(corr >= code_len - 2 * max_bit_errors))
+
+
 def demodulate(iq: np.ndarray, sps: int, code_bits: np.ndarray):
     """鉴频 + 全相位搜索，返回（比特流, 最佳 offset, 频偏标记, Access Code 检出数）。
 
@@ -59,19 +76,14 @@ def demodulate(iq: np.ndarray, sps: int, code_bits: np.ndarray):
     """
     f = np.angle(iq[1:] * np.conj(iq[:-1]))
     f = np.pad(f, (0, sps), mode="edge")
-    code_len = len(code_bits)
-    frame_bits = 216
     best_bits, best_detects, best_off, best_cfo = None, -1, 0, 0.0
     for off in range(sps):
         n = (len(f) - off) // sps
-        if n < frame_bits:
+        if n < 216:
             continue
         sym = f[off : off + n * sps].reshape(n, sps).mean(axis=1)
         bits = (sym > 0).astype(np.uint8)       # 门限固定 0：这是 2-FSK 的判决面
-        detects = 0
-        for start in range(0, n - code_len, frame_bits):
-            if int(np.sum(bits[start : start + code_len] != code_bits)) <= 2:
-                detects += 1
+        detects = count_access_hits(bits, code_bits)
         if detects > best_detects:
             best_bits, best_detects, best_off = bits, detects, off
             best_cfo = float(np.median(sym))     # 仅用于诊断显示

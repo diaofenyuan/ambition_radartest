@@ -166,7 +166,14 @@ def cmd_gfsk(args) -> None:
                       + builder.pack_hp([300, 200, 150, 150, 0, 400])
                       + builder.pack_buff(bytes(41)))
         else:
-            stream = builder.pack_key("AB12CD")
+            # 干扰波规则速率 1350 B/s = 135 B/周期。密钥帧只有 15 B，只喂它会让
+            # 切片器每 2~3 个周期才凑出 1 个空口包，占空比掉到真实值的 1/9，
+            # 接收端 200 ms 窗口里几乎全是静默——现象和"射频没通"一模一样。
+            # 按规则用随机填充补齐到 135 B，才是真实波形密度。
+            key = builder.pack_key("AB12CD")
+            fill = np.random.default_rng(2026).integers(
+                0, 256, season.jammer_bytes_per_cycle - len(key), dtype=np.uint8)
+            stream = key + fill.tobytes()
         packets = chunker.feed(stream)
         iq = (modulator.modulate_stream(b"".join(packets))
               if packets else np.zeros(0, np.complex64))
