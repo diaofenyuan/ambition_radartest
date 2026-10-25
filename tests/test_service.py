@@ -10,6 +10,7 @@
 
 import time
 
+import numpy as np
 import pytest
 
 from radar_tx.config import load_devices_config, load_season_config
@@ -158,4 +159,24 @@ def test_device_role_switch_rejected_while_running():
         svc.stop("info")
     finally:
         svc.shutdown()
+
+
+def test_pluto_tx_keeps_fixed_buffer_length_across_cycles():
+    # 信息波周期长度会在 9 包(91368)与 10 包(101520)之间变化；
+    # 非循环 TX 缓冲长度不可变，必须跨周期保留余量并按固定块推送。
+    class FakeSdr:
+        def __init__(self):
+            self.lengths = []
+
+        def tx(self, data):
+            self.lengths.append(len(data))
+
+    backend = PlutoTx("usb:test", block_samples=100000)
+    backend._sdr = FakeSdr()
+    backend._push(np.zeros(91368, dtype=np.complex64))
+    backend._push(np.zeros(101520, dtype=np.complex64))
+    backend._push(np.zeros(100000, dtype=np.complex64))
+    assert backend._sdr.lengths == [100000, 100000, 100000]
+    assert backend._pending.size == 1520
+    backend.close()
 

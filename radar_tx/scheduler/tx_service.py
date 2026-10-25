@@ -197,7 +197,12 @@ class TxService:
     def _make_backend(self, wave: str) -> TxBackend:
         uri = self._assignments.get(wave)
         if uri:
-            return PlutoTx(uri, underflow_gap_ms=self.devices.underflow_gap_ms)
+            cycle_samples = self.season.modulation.SAMPLE_RATE_HZ // self.season.cycles_per_sec
+            return PlutoTx(
+                uri,
+                underflow_gap_ms=self.devices.underflow_gap_ms,
+                block_samples=cycle_samples,
+            )
 
         def on_iq(iq: np.ndarray, wave: str = wave) -> None:
             # 回环解调放到独立线程：单周期解码约 15ms，若留在发射线程会挤占节拍，

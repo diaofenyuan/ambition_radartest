@@ -4,6 +4,9 @@
 要点：
 - 双板必须分子网（ip:192.168.2.1 / ip:192.168.3.1），URI 用稳定的 ip: 形式；
 - 非循环缓冲连续推流，tx_hardwaregain 以负值表示衰减；
+- Pluto 的非循环 TX 缓冲建立后长度不可变，而信息波每 3 个周期会出现一次
+  10 包超长周期；因此后端必须按固定块推送并跨周期保留余量，否则会触发
+  "Cannot change buffer length on the fly" 并终止发射线程；
 - pyadi-iio 延迟导入，未安装或无硬件时不影响仿真模式运行。
 """
 
@@ -15,10 +18,14 @@ from .base import TxBackend
 
 
 class PlutoTx(TxBackend):
-    def __init__(self, uri: str, underflow_gap_ms: float = 15.0) -> None:
+    def __init__(self, uri: str, underflow_gap_ms: float = 15.0,
+                 block_samples: int = 0) -> None:
         super().__init__(underflow_gap_ms=underflow_gap_ms)
         self._uri = uri
         self._sdr = None
+        # 0 表示不启用定长分块（保留给直接调用后端的场景）；服务层始终传入周期采样数
+        self._block_samples = int(block_samples)
+        self._pending = np.zeros(0, dtype=np.complex64)
 
     def _ensure_device(self):
         if self._sdr is not None:
@@ -40,7 +47,21 @@ class PlutoTx(TxBackend):
 
     def _push(self, iq: np.ndarray) -> None:
         sdr = self._ensure_device()
-        sdr.tx(np.ascontiguousarray(iq, dtype=np.complex64))
+        data = np.ascontiguousarray(iq, dtype=np.complex64)
+        if self._block_samples <= 0:
+            sdr.tx(data)
+            return
+
+        # 每次调用只推一个定长块，保持设备消耗速率恒定：
+        # 超长周期的尾部留到下次，短周期补零；不能在单次调用里把余量全部排空，
+        # 否则会一次性推入两倍采样、破坏 10Hz 节拍。
+        if self._pending.size:
+            data = np.concatenate((self._pending, data))
+        take = min(len(data), self._block_samples)
+        block = np.zeros(self._block_samples, dtype=np.complex64)
+        block[:take] = data[:take]
+        self._pending = data[take:].copy()
+        sdr.tx(block)
 
     def _apply_mute(self) -> None:
         if self._sdr is not None:
@@ -53,3 +74,4 @@ class PlutoTx(TxBackend):
             except Exception:
                 pass
             self._sdr = None
+        self._pending = np.zeros(0, dtype=np.complex64)
