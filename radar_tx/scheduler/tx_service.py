@@ -25,7 +25,7 @@ import numpy as np
 
 from ..config import DevicesConfig, SeasonConfig
 from ..device.base import TxBackend
-from ..device.discovery import DiscoveredDevice, scan_pluto_devices
+from ..device.discovery import DiscoveredDevice, last_scan_note, scan_pluto_devices
 from ..device.libiio_runtime import unavailable_reason as libiio_unavailable_reason
 from ..device.pluto_tx import PlutoTx
 from ..device.virtual_sdr import VirtualSdr
@@ -304,51 +304,70 @@ class TxService:
             self.season.access_code_info if wave == "info" else self.season.access_code_interfere)
         cycle_index = 0
         next_tick = time.monotonic()
-        while not self._stop.is_set():
-            with self._lock:
-                # run_id 失效说明已被 stop/MUTE 或新一轮 start 取代，本线程必须退出，
-                # 不能只看 running：新一轮 start 会把 running 重新置位，导致双线程并发推流
-                if self._run_ids[wave] != run_id:
-                    break
-                running = self.info_running if wave == "info" else self.jammer_running
-            if not running:
-                break
-            next_tick += period  # 绝对截止时间调度，避免节拍漂移累积
-            try:
-                if wave == "info":
-                    stream = self._build_info_stream(builder)
-                else:
-                    stream = self._build_jammer_stream(builder, cycle_index)
-                packets = chunker.feed(stream)
-                iq = modulate_air_packets(packets, self._modulator(wave))
-                if len(iq) < cycle_samples:
-                    # 补零只代表设备端本周期静默，字节流本身没有断。
-                    # 调制器状态故意不在这里复位：复位会让下一周期首个符号从半频偏起步，
-                    # 而接收端做的是跨周期连续的符号定时。
-                    iq = np.pad(iq, (0, cycle_samples - len(iq)))
-                backend = self.backends[wave]
-                # 衰减下发必须与 MUTE 的"衰减拉满"在同一把锁内，且下发前重新校验 run_id：
-                # 否则 MUTE 递增 run_id 后，已在周期体中的这次发射仍会用它持有的配置衰减
-                # （self.attenuation，如 40dB）覆盖掉刚拉满的 89dB，MUTE 硬静音偶发失效。
-                # 推流（transmit）可能阻塞（真机或仿真占位），故放在锁外，仅锁住参数下发。
+
+        def build(idx: int) -> np.ndarray:
+            """生成第 idx 周期的 IQ。
+
+            单周期调制约 9 ms，若与推流串行，周期会变成 109 ms，10 Hz 掉到 9.2 Hz、
+            字节速率只剩标称的 91%；长跑时接收端按 10 Hz 处理就会一直"慢半拍"。
+            所以把它交给单独线程，与上一周期的推流重叠。
+            """
+            if wave == "info":
+                stream = self._build_info_stream(builder)
+            else:
+                stream = self._build_jammer_stream(builder, idx)
+            iq = modulate_air_packets(chunker.feed(stream), self._modulator(wave))
+            if len(iq) < cycle_samples:
+                # 补零只代表设备端本周期静默，字节流本身没有断。
+                # 调制器状态故意不在这里复位：复位会让下一周期首个符号从半频偏起步，
+                # 而接收端做的是跨周期连续的符号定时。
+                iq = np.pad(iq, (0, cycle_samples - len(iq)))
+            return iq
+
+        # 单工作线程：调制状态（builder.seq、chunker 余量、调制器相位）只在它里面推进，
+        # 主线程不并发构建，避免 seq 乱序和相位错位。
+        pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"mod-{wave}")
+        pending = None
+        try:
+            while not self._stop.is_set():
                 with self._lock:
+                    # run_id 失效说明已被 stop/MUTE 或新一轮 start 取代，本线程必须退出，
+                    # 不能只看 running：新一轮 start 会把 running 重新置位，导致双线程并发推流
                     if self._run_ids[wave] != run_id:
                         break
-                    if not (self.info_running if wave == "info" else self.jammer_running):
-                        break
-                    freq, bw, _ = self._rf_params(wave)
-                    backend.configure(freq, bw, self.attenuation[wave], self.season.modulation.SAMPLE_RATE_HZ)
-                backend.transmit(iq)
-                cycle_index += 1
-            except Exception as exc:
-                self._log(f"{wave} 发射异常：{exc}")
-                with self._lock:
-                    self._run_ids[wave] += 1  # 让本线程彻底退出，避免异常后残留
-                    if wave == "info":
-                        self.info_running = False
-                    else:
-                        self.jammer_running = False
-                break
+                    running = self.info_running if wave == "info" else self.jammer_running
+                if not running:
+                    break
+                next_tick += period  # 绝对截止时间调度，避免节拍漂移累积
+                try:
+                    iq = build(cycle_index) if pending is None else pending.result()
+                    pending = pool.submit(build, cycle_index + 1)
+                    backend = self.backends[wave]
+                    # 衰减下发必须与 MUTE 的"衰减拉满"在同一把锁内，且下发前重新校验 run_id：
+                    # 否则 MUTE 递增 run_id 后，已在周期体中的这次发射仍会用它持有的配置衰减
+                    # （self.attenuation，如 40dB）覆盖掉刚拉满的 89dB，MUTE 硬静音偶发失效。
+                    # 推流（transmit）可能阻塞（真机或仿真占位），故放在锁外，仅锁住参数下发。
+                    with self._lock:
+                        if self._run_ids[wave] != run_id:
+                            break
+                        if not (self.info_running if wave == "info" else self.jammer_running):
+                            break
+                        freq, bw, _ = self._rf_params(wave)
+                        backend.configure(freq, bw, self.attenuation[wave],
+                                          self.season.modulation.SAMPLE_RATE_HZ)
+                    backend.transmit(iq)
+                    cycle_index += 1
+                except Exception as exc:
+                    self._log(f"{wave} 发射异常：{exc}")
+                    with self._lock:
+                        self._run_ids[wave] += 1  # 让本线程彻底退出，避免异常后残留
+                        if wave == "info":
+                            self.info_running = False
+                        else:
+                            self.jammer_running = False
+                    break
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
             time.sleep(max(0.0, next_tick - time.monotonic()))
         self._log(f"{wave} 发射已停止")
 
@@ -537,7 +556,9 @@ class TxService:
         """
         if self._discovered_devices:
             return ""
-        return libiio_unavailable_reason()
+        # "扫不到设备"有两种成因：缺原生库（软件）与地址不可达（网络/mDNS）。
+        # 界面必须能区分，否则只会显示一句"未发现设备"，让人以为是板子坏了。
+        return last_scan_note() or libiio_unavailable_reason()
 
     def scan_devices(self) -> List[dict]:
         """重新扫描 PlutoSDR，返回设备列表（含当前角色绑定）。"""

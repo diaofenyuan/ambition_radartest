@@ -9,12 +9,21 @@ libiio 的 ip/usb 后端会把同一块板同时枚举成多个上下文（USB �
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass
 from typing import Dict
 
 from .libiio_runtime import ensure_libiio_available
 
 _SERIAL_RE = re.compile(r"serial=([0-9A-Za-z]+)")
+_IPV4_RE = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
+
+# 最近一次扫描的可读说明：扫不到设备时界面用它解释原因，空串表示正常
+_LAST_NOTE = ""
+
+
+def last_scan_note() -> str:
+    return _LAST_NOTE
 
 
 @dataclass(frozen=True)
@@ -49,8 +58,42 @@ def _model_name(description: str) -> str:
     return "PlutoSDR"
 
 
+def _needs_reachability_probe(uri: str) -> bool:
+    """只有 ip:<主机名> 这种 URI 需要实测。
+
+    libiio 会把同一块板通过 mDNS 广播成一个 ip:pluto.local 上下文。机器上没有
+    mDNS 解析器时这个名字会被普通 DNS 抢答——实测在本机解析到公网 198.20.0.21，
+    照抄它去绑定设备必然连不上。与其给出一个连不上的地址，不如不给。
+    纯数字 IP 与 USB 上下文直接信任，免得每次扫描都多等两秒。
+    """
+    if not uri.startswith("ip:"):
+        return False
+    host = uri[3:].split(":")[0]
+    return _IPV4_RE.fullmatch(host) is None
+
+
+def _reachable(uri: str, timeout_s: float = 2.0) -> bool:
+    """建立一次真实上下文确认 URI 可用；超时按不可用处理。"""
+    import iio
+    verdict: Dict[str, bool] = {}
+
+    def probe() -> None:
+        try:
+            iio.Context(uri)
+            verdict["ok"] = True
+        except Exception:
+            verdict["ok"] = False
+
+    worker = threading.Thread(target=probe, daemon=True)
+    worker.start()
+    worker.join(timeout_s)
+    return verdict.get("ok", False)
+
+
 def scan_pluto_devices() -> list[DiscoveredDevice]:
     """扫描当前主机可见的 PlutoSDR；无依赖或扫描失败时返回空列表。"""
+    global _LAST_NOTE
+    _LAST_NOTE = ""
     # 必须在 import iio 之前把原生库目录挂进 PATH，否则 find_library 找不到
     # libiio.dll，导入阶段直接抛 TypeError。
     libiio_ok, _ = ensure_libiio_available()
@@ -67,16 +110,21 @@ def scan_pluto_devices() -> list[DiscoveredDevice]:
         return []
 
     found: Dict[str, DiscoveredDevice] = {}
+    skipped: list[str] = []
     for uri, description in contexts.items():
+        uri = str(uri)
         description = str(description)
-        if not _is_pluto(str(uri), description):
+        if not _is_pluto(uri, description):
+            continue
+        if _needs_reachability_probe(uri) and not _reachable(uri):
+            skipped.append(uri)
             continue
         match = _SERIAL_RE.search(description)
         serial = match.group(1) if match else ""
         # 没有序列号时按 URI 去重，避免把不同设备合并
-        key = serial or str(uri)
+        key = serial or uri
         candidate = DiscoveredDevice(
-            uri=str(uri),
+            uri=uri,
             description=description,
             serial=serial,
             model=_model_name(description),
@@ -85,4 +133,7 @@ def scan_pluto_devices() -> list[DiscoveredDevice]:
         if old is None or _prefer_rank(candidate.uri) < _prefer_rank(old.uri):
             found[key] = candidate
 
+    if skipped and not found:
+        _LAST_NOTE = (f"已忽略连不上的地址 {'、'.join(skipped)}；"
+                      f"请改用 USB 直连，或手动填写 ip:192.168.2.1")
     return sorted(found.values(), key=lambda d: (d.serial, d.uri))

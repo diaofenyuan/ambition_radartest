@@ -15,8 +15,9 @@ import numpy as np
 import pytest
 
 from radar_tx.config import load_devices_config, load_season_config
-from radar_tx.device.discovery import DiscoveredDevice, scan_pluto_devices
-from radar_tx.device.pluto_tx import PlutoTx
+from radar_tx.device import discovery
+from radar_tx.device.discovery import DiscoveredDevice, last_scan_note, scan_pluto_devices
+from radar_tx.device.pluto_tx import PlutoTx, _set_tx_gain, _tx_gain_attr
 from radar_tx.device.virtual_sdr import VirtualSdr
 from radar_tx.protocol.serial_frame import (
     CMD_FIELD_STATUS, CMD_INTERFERENCE_KEY, CMD_ROBOT_BUFF, CMD_ROBOT_POSITION,
@@ -154,10 +155,60 @@ def test_scan_dedupes_same_board_and_ignores_non_pluto(monkeypatch):
         "ip:other.local": "192.168.1.9 (Some Other IIO Device), serial=other",
     }
     monkeypatch.setattr(iio, "scan_contexts", lambda: contexts)
+    # mDNS 名字的连通性探测会走真实网络，测试里固定为不可达，保证确定性
+    monkeypatch.setattr(discovery, "_reachable", lambda uri, timeout_s=2.0: False)
     devices = scan_pluto_devices()
     assert len(devices) == 1
     assert devices[0].uri == "usb:1.6.5"  # 同一块板优先保留 USB
     assert devices[0].serial == "03df62"
+
+
+def test_scan_drops_unreachable_mdns_uri(monkeypatch):
+    # ip:pluto.local 在没有 mDNS 解析器的机器上会被普通 DNS 抢答（实测解析到公网
+    # 198.20.0.21），照抄它绑定设备必然连不上。既然实测不通就必须丢弃，
+    # 而不是把坏地址摆在界面上让人点。
+    try:
+        import iio
+    except Exception:
+        pytest.skip("未加载到 libiio 原生库，跳过真机扫描用例")
+
+    monkeypatch.setattr(iio, "scan_contexts",
+                        lambda: {"ip:pluto.local": "fe80::1 (PlutoSDR Rev.B), serial=abc"})
+    monkeypatch.setattr(discovery, "_reachable", lambda uri, timeout_s=2.0: False)
+    assert scan_pluto_devices() == []
+    assert "ip:pluto.local" in last_scan_note()
+
+
+def test_mdns_probe_only_for_hostname_uris():
+    assert discovery._needs_reachability_probe("ip:pluto.local") is True
+    assert discovery._needs_reachability_probe("ip:192.168.2.1") is False
+    assert discovery._needs_reachability_probe("usb:1.6.5") is False
+
+
+def test_tx_gain_attr_ignores_stale_instance_attribute():
+    # 历史代码写 sdr.tx_hardwaregain = -40 时不会报错，只会给对象挂一个无效属性。
+    # 探测必须仍然认准硬件属性名，否则修完还会被脏属性骗一次。
+    class Modern:
+        tx_hardwaregain_chan0 = 0
+
+    sdr = Modern()
+    sdr.tx_hardwaregain = -40          # 模拟旧 bug 留下的脏属性
+    assert _tx_gain_attr(sdr) == "tx_hardwaregain_chan0"
+
+
+def test_set_tx_gain_reaches_hardware_attribute():
+    class Legacy:
+        tx_hardwaregain = 0
+
+    class Modern:
+        tx_hardwaregain_chan0 = 0
+
+    modern = Modern()
+    _set_tx_gain(modern, 40)
+    assert modern.tx_hardwaregain_chan0 == -40
+    legacy = Legacy()
+    _set_tx_gain(legacy, 89)
+    assert legacy.tx_hardwaregain == -89
 
 
 def test_device_role_switch_rebuilds_backend():
