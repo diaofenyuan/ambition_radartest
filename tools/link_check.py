@@ -59,7 +59,7 @@ def _start_tone(args) -> tuple:
     """
     import threading
 
-    from radar_tx.device.pluto_tx import _set_tx_gain, _tx_gain_attr
+    from radar_tx.device.pluto_tx import _set_tx_gain, _tx_gain_attr, to_dac_scale
     tx = _open(args.tx_uri, "发射板")
     try:
         tx.tx_destroy_buffer()
@@ -71,7 +71,7 @@ def _start_tone(args) -> tuple:
     tx.tx_rf_bandwidth = int(args.bw)
     _set_tx_gain(tx, abs(args.tx_gain))
     n = np.arange(BUFFER)
-    tone = (0.5 * np.exp(1j * 2 * np.pi * TONE_HZ * n / FS)).astype(np.complex64)
+    tone = to_dac_scale((0.5 * np.exp(1j * 2 * np.pi * TONE_HZ * n / FS)).astype(np.complex64))
     # 设置成功不等于生效：LO 会被量化、增益会被步进截断，必须回读确认
     info = (f"TX {tx.tx_lo / 1e6:.6f} MHz  衰减 {getattr(tx, _tx_gain_attr(tx), '?')} dB"
             f"  RF 带宽 {tx.tx_rf_bandwidth / 1e3:.0f} kHz  持续发射中")

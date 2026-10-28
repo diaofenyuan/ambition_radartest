@@ -29,7 +29,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # 增益必须走这个统一入口：pyadi 的 TX 增益属性名随版本变，写错名字不报错、
 # 只会在对象上挂一个没人读的属性，硬件增益原地不动。
-from radar_tx.device.pluto_tx import _set_tx_gain, _tx_gain_attr  # noqa: E402
+from radar_tx.device.pluto_tx import (  # noqa: E402
+    _set_tx_gain, _tx_gain_attr, to_dac_scale, tx_rf_bandwidth,
+)
 
 BLOCK = 100_000   # 与调度层一致的定长块：非循环 TX 缓冲建立后长度不可变
 
@@ -109,7 +111,7 @@ def _run(sdr, block_source, seconds: float, destroy) -> None:
     try:
         while time.monotonic() < end:
             t0 = time.monotonic()
-            sdr.tx(block_source())
+            sdr.tx(to_dac_scale(block_source()))
             count += 1
             print(f"\r  已推 {count} 块，单块耗时 {(time.monotonic() - t0) * 1e3:.1f} ms", end="")
     except KeyboardInterrupt:
@@ -152,7 +154,11 @@ def cmd_gfsk(args) -> None:
     sdr = _open(args.uri, args.tx_channel)
     sdr.sample_rate = int(season.modulation.SAMPLE_RATE_HZ)
     sdr.tx_lo = int(profile.freq_hz)
-    sdr.tx_rf_bandwidth = int(profile.bandwidth_hz)
+    # 模拟滤波带宽贴着信号带宽设会被严重削顶：jammer_3 的 250 kHz 实测比
+    # 540 kHz 低 21 dB，波形根本出不去。默认走驱动层的统一策略，--rf-bw 可覆盖。
+    sdr.tx_rf_bandwidth = (int(args.rf_bw) if args.rf_bw else
+                           tx_rf_bandwidth(profile.bandwidth_hz,
+                                           season.modulation.SAMPLE_RATE_HZ))
     _set_tx_gain(sdr, abs(args.gain))
     _report(sdr, f"已下发（{args.team}/{args.wave}，Δf={profile.freq_deviation_hz:.0f} Hz）")
     print(f"  → 频谱仪应看到约 {profile.bandwidth_hz / 1e3:.0f} kHz 宽的 2-GFSK 谱")
@@ -214,6 +220,9 @@ def main() -> None:
     gfsk.add_argument("--team", default="red", choices=["red", "blue"])
     gfsk.add_argument("--wave", default="info",
                       choices=["info", "jammer_1", "jammer_2", "jammer_3"])
+    gfsk.add_argument("--rf-bw", type=float, default=0,
+                      help="覆盖 TX 模拟滤波带宽 Hz；留空=信号带宽。"
+                           "窄带波形（如 jammer_3 的 250k）留空会被削掉约 21 dB")
     gfsk.set_defaults(func=cmd_gfsk)
 
     args = p.parse_args()
