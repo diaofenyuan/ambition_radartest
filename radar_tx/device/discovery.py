@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict
 
@@ -109,14 +110,28 @@ def scan_pluto_devices() -> list[DiscoveredDevice]:
     except Exception:
         return []
 
-    found: Dict[str, DiscoveredDevice] = {}
-    skipped: list[str] = []
+    candidates: list[tuple[str, str]] = []
     for uri, description in contexts.items():
         uri = str(uri)
         description = str(description)
         if not _is_pluto(uri, description):
             continue
-        if _needs_reachability_probe(uri) and not _reachable(uri):
+        candidates.append((uri, description))
+
+    # 并行探测：ip:<主机名> 走到公网 DNS 时会一直卡到超时，串行时每块板叠 2 秒，
+    # 两块板（各自还带一条 mDNS 上下文）就能把启动拖到 8 秒以上——比 start.bat
+    # 的等待时间长，用户打开页面时服务还没起来。并起来只花一个超时周期。
+    need_probe = [u for u, _ in candidates if _needs_reachability_probe(u)]
+    verdict: Dict[str, bool] = {}
+    if need_probe:
+        with ThreadPoolExecutor(max_workers=min(8, len(need_probe))) as pool:
+            for target, reachable in zip(need_probe, pool.map(_reachable, need_probe)):
+                verdict[target] = reachable
+
+    found: Dict[str, DiscoveredDevice] = {}
+    skipped: list[str] = []
+    for uri, description in candidates:
+        if verdict.get(uri) is False:
             skipped.append(uri)
             continue
         match = _SERIAL_RE.search(description)

@@ -72,8 +72,9 @@ REM 4) 启动服务，并延时自动打开控制台页面；最后一个页面�
 echo [启动] 雷达无线电自测模拟发射系统 ...  http://%HOST%:%PORT%
 echo [提示] 关闭最后一个控制台页面约 3 秒后，自动静音并退出后端。
 echo.
-REM 独立后台进程等待端口就绪后打开浏览器，避免与前台服务互阻塞
-start "" /b powershell -NoProfile -WindowStyle Hidden -Command "Start-Sleep -Seconds 2; Start-Process 'http://%HOST%:%PORT%'"
+REM 独立后台进程轮询端口，真正就绪后再打开浏览器。设备扫描（libiio USB 枚举 +
+REM mDNS 探测）实测要 8 秒左右，原先写死等 2 秒会让页面先打开并报连接失败。
+start "" /b powershell -NoProfile -WindowStyle Hidden -Command "for($i=0;$i -lt 80;$i++){ try { $c=New-Object Net.Sockets.TcpClient; $c.Connect('%HOST%',%PORT%); $c.Close(); break } catch { Start-Sleep -Milliseconds 300 } }; Start-Process 'http://%HOST%:%PORT%'"
 "%VPY%" app.py %*
 
 echo.

@@ -190,7 +190,9 @@ class TxService:
         return rows
 
     def _role_snapshot_locked(self, wave: str) -> dict:
-        uri = self._assignments[wave]
+        # 用 get：这是每 0.5 秒推一次的快照路径，一旦因缺 key 抛异常，
+        # WebSocket 会直接断开、页面失去所有状态更新，代价远大于这里少一层校验。
+        uri = self._assignments.get(wave)
         if not uri:
             return {"uri": None, "model": "虚拟 SDR", "virtual": True}
         return {"uri": uri, "model": self._model_for_uri_locked(uri), "virtual": False}
@@ -295,9 +297,6 @@ class TxService:
 
     def _engine_loop(self, wave: str, run_id: int) -> None:
         period = 1.0 / self.season.cycles_per_sec
-        # 周期 IQ 补零到整周期采样数：供样量与设备消耗速率严格相等，
-        # 否则每周期 8.6% 的供样亏空在真机上必然欠采
-        cycle_samples = self.season.modulation.SAMPLE_RATE_HZ // self.season.cycles_per_sec
         builder = SerialFrameBuilder()
         # 空口流按 15 字节连续切片且跨周期保留余量（规则附录 1：数据流连续切分）
         chunker = AirStreamChunker(
@@ -317,11 +316,12 @@ class TxService:
             else:
                 stream = self._build_jammer_stream(builder, idx)
             iq = modulate_air_packets(chunker.feed(stream), self._modulator(wave))
-            if len(iq) < cycle_samples:
-                # 补零只代表设备端本周期静默，字节流本身没有断。
-                # 调制器状态故意不在这里复位：复位会让下一周期首个符号从半频偏起步，
-                # 而接收端做的是跨周期连续的符号定时。
-                iq = np.pad(iq, (0, cycle_samples - len(iq)))
+            # 不在这里补零到整周期：补零会把 9 包周期（91368 采样）抬到 100000，
+            # 而每 3 个周期一次的 10 包周期本身就是 101520，平均产出 100507
+            # 大于设备消耗的 100000——实测 300 周期积压 152 ms 且持续增长，
+            # 发出去的内容会越来越滞后。留原始长度，块尾补零由后端统一做。
+            # 调制器状态故意不复位：复位会让下一周期首符号从半频偏起步，
+            # 而接收端做的是跨周期连续的符号定时。
             return iq
 
         # 单工作线程：调制状态（builder.seq、chunker 余量、调制器相位）只在它里面推进，
@@ -432,6 +432,27 @@ class TxService:
             # 新一轮从零相位、零滤波历史起步：中断期间射频是静的，
             # 若接着上一轮残留的相位发，开头会凭空多出一个相位跳变。
             self._modulator(wave).reset()
+
+        # 预热设备：首次 configure 要打开 USB 上下文并重算采样时钟，实测 3~4 秒。
+        # 留在发射线程里做会一直占着服务锁，WebSocket 推送和所有 API 一起卡住，
+        # 用户点完"开始发射"看到的是一片无响应。放在这里只阻塞这一次请求，
+        # 之后线程里的 configure 因为参数已生效会直接跳过，不重复下发。
+        if self._assignments.get(wave):
+            freq, bw, _ = self._rf_params(wave)
+            try:
+                self.backends[wave].configure(
+                    freq, bw, self.attenuation[wave],
+                    self.season.modulation.SAMPLE_RATE_HZ)
+            except Exception as exc:
+                with self._lock:
+                    self._run_ids[wave] += 1
+                    if wave == "info":
+                        self.info_running = False
+                    else:
+                        self.jammer_running = False
+                self._log(f"{wave} 设备初始化失败：{exc}")
+                raise ValueError(f"设备初始化失败：{exc}") from exc
+
         thread = threading.Thread(target=self._engine_loop, args=(wave, run_id),
                                   daemon=True, name=f"tx-{wave}")
         self._threads[wave] = thread
