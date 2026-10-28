@@ -425,6 +425,11 @@ function renderLogs(logs) {
   box.scrollTop = box.scrollHeight - fromBottom;
 }
 
+// 衰减下发状态：定义在 render 之前，否则首次渲染会撞上暂时性死区
+const attPending = { info: false, jammer: false };
+const attTimer = { info: null, jammer: null };
+const attSeq = { info: 0, jammer: 0 };
+
 function render(s) {
   const first = !state;
   state = s;
@@ -450,8 +455,9 @@ function render(s) {
   // 切勿每次推送(0.5s)都回写服务端值：用户在下拉框选中新等级后会被立刻改回原值，
   // 表现为"干扰等级无法切换"。
 
-  $("infoAttVal").textContent = s.info.attenuation_db;
-  $("jamAttVal").textContent = s.jammer.attenuation_db;
+  // 下发在途时冻结数字：否则用户拖到一半，0.5s 的推送会把数字盖回旧值
+  if (!attPending.info) $("infoAttVal").textContent = s.info.attenuation_db;
+  if (!attPending.jammer) $("jamAttVal").textContent = s.jammer.attenuation_db;
 
   $("infoRf").textContent = `${fmtFreq(s.info.freq_hz)} / ${fmtBw(s.info.bandwidth_hz)} / ${fmtDbm(s.info.power_dbm)}`;
   $("jamRf").textContent = `${fmtFreq(s.jammer.freq_hz)} / ${fmtBw(s.jammer.bandwidth_hz)} / ${fmtDbm(s.jammer.power_dbm)}`;
@@ -544,10 +550,37 @@ $("keyInput").addEventListener("input", () => {
   const v = $("keyInput").value.replace(/[^0-9A-Za-z]/g, "").slice(0, 6);
   if (v !== $("keyInput").value) $("keyInput").value = v;
 });
-$("infoAtt").oninput = () => { $("infoAttVal").textContent = $("infoAtt").value; };
-$("jamAtt").oninput = () => { $("jamAttVal").textContent = $("jamAtt").value; };
-$("infoAtt").onchange = () => api("/api/attenuation", "POST", { wave: "info", attenuation_db: parseFloat($("infoAtt").value) });
-$("jamAtt").onchange = () => api("/api/attenuation", "POST", { wave: "jammer", attenuation_db: parseFloat($("jamAtt").value) });
+// 衰减下发：拖动即生效（节流 120ms），松开时再补发一次最终值。
+// 只挂 onchange 的话，拖动过程中数字在变、硬件不动，看起来像"调了没反应"。
+// attPending 用于在请求在途时冻结显示值，否则 0.5s 一次的状态推送
+// 会把用户刚拖到的数字盖回服务端的旧值。
+function pushAtt(wave, el) {
+  if (attTimer[wave]) { clearTimeout(attTimer[wave]); attTimer[wave] = null; }
+  const seq = ++attSeq[wave];
+  attPending[wave] = true;
+  api("/api/attenuation", "POST", { wave, attenuation_db: parseFloat(el.value) })
+    .catch(() => {})
+    .finally(() => {
+      // 连续拖动会连发多次，只让最后一次回来时解除冻结
+      if (seq === attSeq[wave]) attPending[wave] = false;
+    });
+}
+
+function scheduleAtt(wave, el) {
+  if (attTimer[wave]) clearTimeout(attTimer[wave]);
+  attTimer[wave] = setTimeout(() => pushAtt(wave, el), 120);
+}
+
+$("infoAtt").oninput = () => {
+  $("infoAttVal").textContent = $("infoAtt").value;
+  scheduleAtt("info", $("infoAtt"));
+};
+$("jamAtt").oninput = () => {
+  $("jamAttVal").textContent = $("jamAtt").value;
+  scheduleAtt("jammer", $("jamAtt"));
+};
+$("infoAtt").onchange = () => pushAtt("info", $("infoAtt"));
+$("jamAtt").onchange = () => pushAtt("jammer", $("jamAtt"));
 
 // ---- 状态更新：WebSocket 推送，断线自动回退轮询 ----
 // WebSocket 每 0.5s 推一次快照；若服务端缺少 websockets 库或连接中断，
