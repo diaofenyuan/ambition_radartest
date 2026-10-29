@@ -26,14 +26,14 @@ def test_serial_frame_roundtrip():
     assert decoded[1].payload == b"AB1200"  # 密钥不足 6 位右侧补 '0'
 
 
-def test_buff_payload_is_41_bytes():
-    # 0x0A05 载荷固定 41 字节（协议 V2.0.0 表 1-48）
+def test_buff_payload_is_47_bytes():
+    # 0x0A05 载荷固定 47 字节（通信协议 V1.0.0 表 1-45）
     builder = SerialFrameBuilder()
-    frame = builder.pack_buff(os.urandom(41))
-    assert len(frame) == 41 + 9
+    frame = builder.pack_buff(os.urandom(47))
+    assert len(frame) == 47 + 9
     try:
-        builder.pack_buff(os.urandom(36))
-        assert False, "36 字节载荷应被拒绝"
+        builder.pack_buff(os.urandom(41))
+        assert False, "41 字节载荷应被拒绝"
     except ValueError:
         pass
 
@@ -45,13 +45,13 @@ def test_key_frame_is_exactly_one_air_payload():
 
 
 def test_stream_chunker_continuity():
-    # 信息波 140B/周期不整除 15B：切片余量必须跨周期延续（规则：数据流连续切分）
+    # 信息波 150B/周期恰好 10 个空口包；切片余量仍须跨周期延续
     chunker = AirStreamChunker(ACCESS_CODE_INFO)
     total_packets = 0
     for _ in range(3):
-        total_packets += len(chunker.feed(os.urandom(140)))
-    # 3 周期共 420B → 恰好 28 个空口包
-    assert total_packets == 28
+        total_packets += len(chunker.feed(os.urandom(150)))
+    # 3 周期共 450B → 30 个空口包
+    assert total_packets == 30
 
 
 def test_cross_packet_sliding_decode():

@@ -200,7 +200,7 @@
   </section>
 </main>
 
-<!-- 无线电规则核对带：与规则手册 V2.2.0 表 5-23 逐项对照 -->
+<!-- 无线电规则核对带：射频参数对齐规则手册 V2.2.0 表 5-23，业务帧对齐通信协议 V1.0.0 §1.5 -->
 <section class="rulesband">
   <div class="card">
     <h2>无线电规则核对 <span class="tag" id="rulesSrcTag">规则手册 V2.2.0</span></h2>
@@ -367,7 +367,9 @@ function buildRules(rules) {
     `<span>信息波 Access Code <code>${esc(rules.access_code_info)}</code></span>` +
     `<span>干扰波 Access Code <code>${esc(rules.access_code_interfere)}</code></span>` +
     `<span>信息波速率 <b>${esc(rules.info_rate)}</b></span>` +
-    `<span>干扰波速率 <b>${esc(rules.jammer_rate)}</b></span>`;
+    `<span>干扰波速率 <b>${esc(rules.jammer_rate)}</b></span>` +
+    (rules.capacity && !rules.capacity.ok
+      ? `<span class="tag warn">空口容量 ${esc(rules.capacity.note)}</span>` : "");
   const grid = $("waveGrid");
   grid.innerHTML = "";
   for (const p of rules.profiles) {

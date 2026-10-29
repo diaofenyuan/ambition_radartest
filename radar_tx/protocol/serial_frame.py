@@ -17,12 +17,12 @@ from .crc import CRC8_INIT, CRC16_INIT, crc8, crc16
 
 SOF = 0xA5
 
-# 业务命令 ID
-CMD_ROBOT_POSITION = 0x0A01  # 敌方 6 台机器人坐标，12 × int16（x,y 单位 cm）
-CMD_ROBOT_HP = 0x0A02        # 6 台机器人血量，6 × uint16
-CMD_ROBOT_AMMO = 0x0A03      # 允许发弹量等，5 × uint16
-CMD_FIELD_STATUS = 0x0A04    # 场地状态：剩余金币、总金币、状态标志
-CMD_ROBOT_BUFF = 0x0A05      # 增益与哨兵姿态，固定 41 字节（表 1-48）
+# 业务命令 ID（2027 通信协议 V1.0.0 §1.5 表 1-41 ~ 1-46）
+CMD_ROBOT_POSITION = 0x0A01  # 敌方机器人坐标，12 × int16（x,y 单位 cm，第 2/5 组为保留位）
+CMD_ROBOT_HP = 0x0A02        # 6 × uint16，第 2/5 项为保留位
+CMD_ROBOT_AMMO = 0x0A03      # 5 × uint16，第 4 项为保留位
+CMD_FIELD_STATUS = 0x0A04    # 宏观状态：剩余/总金币 + 两个 4 字节状态字，共 12 字节
+CMD_ROBOT_BUFF = 0x0A05      # 增益、状态与装甲加固圆，固定 47 字节（表 1-45）
 CMD_INTERFERENCE_KEY = 0x0A06  # 干扰密钥，6 字节 ASCII
 
 ALL_CMDS = (
@@ -63,10 +63,10 @@ class SerialFrameBuilder:
         self._seq = (self._seq + 1) & 0xFF
         return frame
 
-    # ---- 语义化业务载荷构造（字段定义对齐 RMUC2026 规则） ----
+    # ---- 语义化业务载荷构造（字段定义对齐通信协议 V1.0.0 §1.5） ----
 
     def pack_position(self, coords_cm: Iterable[int]) -> bytes:
-        """coords_cm 为 12 个 int16：6 台机器人的 (x, y)。"""
+        """coords_cm 为 12 个 int16（6 组 x,y）；第 2、5 组按表 1-41 为保留位。"""
         values = list(coords_cm)
         if len(values) != 12:
             raise ValueError("坐标必须为 12 个 int16（6 台 × x,y）")
@@ -84,20 +84,23 @@ class SerialFrameBuilder:
             raise ValueError("弹量必须为 5 个 uint16")
         return self.pack(CMD_ROBOT_AMMO, struct.pack("<5H", *values))
 
-    def pack_field_status(self, remain_coins: int, total_coins: int, status_flags: int) -> bytes:
+    def pack_field_status(self, remain_coins: int, total_coins: int,
+                          gauge_flags: int, terrain_flags: int) -> bytes:
+        """0x0A04：金币 + 增益点状态字 + 地形跨越/阵地控制状态字（表 1-44）。"""
         return self.pack(
             CMD_FIELD_STATUS,
-            struct.pack("<HHI", remain_coins & 0xFFFF, total_coins & 0xFFFF, status_flags & 0xFFFFFFFF),
+            struct.pack("<HHII", remain_coins & 0xFFFF, total_coins & 0xFFFF,
+                        gauge_flags & 0xFFFFFFFF, terrain_flags & 0xFFFFFFFF),
         )
 
     def pack_buff(self, payload: bytes) -> bytes:
-        """0x0A05 载荷固定 41 字节（协议 V2.0.0 表 1-48：5 台机器人 × 7B 增益 + 6B）。"""
-        if len(payload) != 41:
-            raise ValueError("0x0A05 载荷必须为 41 字节")
+        """0x0A05 载荷固定 47 字节（表 1-45：5 × 7B 增益 + 6B 状态 + 6B 加固圆）。"""
+        if len(payload) != 47:
+            raise ValueError("0x0A05 载荷必须为 47 字节")
         return self.pack(CMD_ROBOT_BUFF, payload)
 
     def pack_key(self, key_text: str, pad_char: str = "0") -> bytes:
-        """干扰密钥固定 6 字节 ASCII（表 1-49），不足右侧补 pad_char。
+        """干扰密钥固定 6 字节 ASCII（表 1-46），不足右侧补 pad_char。
 
         补位只是兜底：正常路径上密钥在状态层就已补齐到 6 位，
         这样界面显示的串与真正发出去的那 6 个字节才是同一个东西。

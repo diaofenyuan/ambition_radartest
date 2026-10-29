@@ -70,29 +70,29 @@ def test_freq_deviation_follows_loaded_symbol_rate():
 
 @pytest.mark.parametrize("team", ["red", "blue"])
 def test_info_wave_loopback(team):
-    # 信息波周期流：5 命令帧 = 33+21+19+17+50 = 140B（规则 1400B/s 全有效数据）
+    # 信息波周期流：5 命令帧 = 33+21+19+21+56 = 150B（各命令 10Hz）
     builder = SerialFrameBuilder()
     stream = (builder.pack_position(range(12))
-              + builder.pack_hp([100, 200, 300, 400, 0, 600])
-              + builder.pack_ammo([10, 20, 30, 40, 50])
-              + builder.pack_field_status(100, 2000, 3)
-              + builder.pack_buff(os.urandom(41)))
-    assert len(stream) == 140
-    # 连续喂入三个周期：420B 恰好 28 个空口包，且跨周期帧能完整恢复
+              + builder.pack_hp([100, 0, 300, 400, 0, 600])
+              + builder.pack_ammo([10, 20, 30, 0, 50])
+              + builder.pack_field_status(100, 2000, 3, 0)
+              + builder.pack_buff(os.urandom(47)))
+    assert len(stream) == 150
+    # 连续喂入三个周期：450B 恰好 30 个空口包，且跨周期帧能完整恢复
     chunker = AirStreamChunker(SEASON.access_code_info)
     packets = []
     for _ in range(3):
         packets.extend(chunker.feed(stream))
-    assert len(packets) == 28
+    assert len(packets) == 30
     profile = SEASON.profile(team, "info")
     iq = modulate_air_packets(packets, GfskModulator(SEASON.modulation, profile))
 
     result = LoopbackDecoder(SEASON).decode(iq, is_info=True)
     expected_cmds = [CMD_ROBOT_POSITION, CMD_ROBOT_HP, CMD_ROBOT_AMMO, CMD_FIELD_STATUS, CMD_ROBOT_BUFF]
     assert [f.cmd_id for f in result.frames] == expected_cmds * 3
-    assert len(result.frames[4].payload) == 41
+    assert len(result.frames[4].payload) == 47
     assert result.frames[1].payload == bytes.fromhex(
-        "6400c8002c01900100005802")  # 第 5 项保留位为 0
+        "640000002c01900100005802")  # 工程位与第 5 项保留位为 0
 
 
 @pytest.mark.parametrize("team", ["red", "blue"])

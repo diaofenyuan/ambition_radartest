@@ -29,7 +29,7 @@ from ..device.discovery import DiscoveredDevice, last_scan_note, scan_pluto_devi
 from ..device.libiio_runtime import unavailable_reason as libiio_unavailable_reason
 from ..device.pluto_tx import PlutoTx
 from ..device.virtual_sdr import VirtualSdr
-from ..protocol.air_frame import AIR_PAYLOAD_LEN, AirStreamChunker
+from ..protocol.air_frame import AIR_FRAME_LEN, AIR_PAYLOAD_LEN, AirStreamChunker
 from ..protocol.serial_frame import (
     ALL_CMDS, CMD_FIELD_STATUS, CMD_INTERFERENCE_KEY, CMD_ROBOT_AMMO,
     CMD_ROBOT_BUFF, CMD_ROBOT_HP, CMD_ROBOT_POSITION, SerialFrameBuilder,
@@ -48,10 +48,10 @@ CMD_NAMES = {
 }
 INFO_CMDS = (CMD_ROBOT_POSITION, CMD_ROBOT_HP, CMD_ROBOT_AMMO, CMD_FIELD_STATUS, CMD_ROBOT_BUFF)
 
-# 各命令业务载荷字节数（协议 V2.0.0 表 1-44 ~ 1-48）
+# 各命令业务载荷字节数（2027 通信协议 V1.0.0 表 1-41 ~ 1-46）
 CMD_PAYLOAD_LEN = {
     CMD_ROBOT_POSITION: 24, CMD_ROBOT_HP: 12, CMD_ROBOT_AMMO: 10,
-    CMD_FIELD_STATUS: 8, CMD_ROBOT_BUFF: 41, CMD_INTERFERENCE_KEY: 6,
+    CMD_FIELD_STATUS: 12, CMD_ROBOT_BUFF: 47, CMD_INTERFERENCE_KEY: 6,
 }
 
 # 密钥字符集：规则为"6 位数字字母组合"
@@ -117,6 +117,7 @@ class TxService:
         }
         self._coords = [random.randint(0, _FIELD_X_CM) if i % 2 == 0 else random.randint(0, _FIELD_Y_CM)
                         for i in range(12)]
+        self._zero_reserved_position()
 
         # ---- 发射链路 ----
         self._mods: Dict[Tuple[str, str], GfskModulator] = {}
@@ -139,6 +140,10 @@ class TxService:
             f"初始化完成：模式={self._current_mode_locked()}，赛季={season.season}，"
             f"发现 Pluto 设备 {len(self._discovered_devices)} 台"
         )
+        capacity = self._capacity_snapshot()
+        if not capacity["ok"]:
+            # 业务帧变长后可能塞不进 100 ms 空口周期，必须显式暴露而不是静默跑偏
+            self._log(f"空口容量告警：{capacity['note']}")
 
     # ==================== 内部工具 ====================
 
@@ -252,41 +257,73 @@ class TxService:
             for i in range(0, 12, 2):
                 self._coords[i] = max(0, min(_FIELD_X_CM, self._coords[i] + random.randint(-300, 300)))
                 self._coords[i + 1] = max(0, min(_FIELD_Y_CM, self._coords[i + 1] + random.randint(-200, 200)))
+            self._zero_reserved_position()
             return struct.pack("<12h", *self._coords)
         if cmd_id == CMD_ROBOT_HP:
-            # 序列：英雄/工程/3步/4步/保留/哨兵，第 5 项为保留位恒 0（协议表 1-45）
+            # 表 1-42：重装/保留/3步/4步/保留/哨兵。工程与第 5 项均为保留位，必须为 0。
             hps = [random.randint(0, 600) for _ in range(6)]
+            hps[1] = 0
             hps[4] = 0
             return struct.pack("<6H", *hps)
         if cmd_id == CMD_ROBOT_AMMO:
-            return struct.pack("<5H", *(random.randint(0, 500) for _ in range(5)))
+            # 表 1-43：重装/3步/4步/保留/哨兵。
+            ammos = [random.randint(0, 500) for _ in range(5)]
+            ammos[3] = 0
+            return struct.pack("<5H", *ammos)
         if cmd_id == CMD_FIELD_STATUS:
-            # 4 字节状态字按表 1-47 的位域逐段拼装。中央高地、堡垒、前哨站都是多值
-            # 枚举，直接塞 0~7 的随机数会造出"3"这种非法占位（中央高地只有 0/1/2）。
-            flags = (
-                random.randint(0, 1)               # bit0 补给区占领
-                | random.randint(0, 2) << 1        # bit1-2 中央高地（1 对方 / 2 己方）
-                | random.randint(0, 1) << 3        # bit3 梯形高地
-                | random.randint(0, 3) << 4        # bit4-5 堡垒增益点
-                | random.randint(0, 2) << 6        # bit6-7 前哨站增益点
-                | random.randint(0, 1) << 8        # bit8 基地增益点
-                | random.randint(0, 0x7F) << 9     # bit9-15 场地交互模块卡状态位
+            # 表 1-44：两个 4 字节状态字。增益点是多值枚举，且"对方未控制对应阵地"
+            # 有独立编码（前哨/堡垒/基地为 4，中央高地为 3）；用 0~7 的随机数
+            # 会造出协议里不存在的占位值，接收端按位域解析会得到非法状态。
+            gauge = (
+                random.randint(0, 1)                    # bit0 对方补给区激活
+                | random.choice((0, 1, 2, 3, 4)) << 1   # bit1-3 R 堡垒增益点
+                | random.choice((0, 1, 2, 3, 4)) << 4   # bit4-6 B 堡垒增益点
+                | random.choice((0, 1, 2, 3, 4)) << 7   # bit7-9 R 基地增益点
+                | random.choice((0, 1, 2, 3, 4)) << 10  # bit10-12 B 基地增益点
+                | random.randint(0, 1) << 13            # bit13 对方制高点
+                | random.choice((0, 1, 2, 3)) << 14     # bit14-15 R 中央高地
+                | random.choice((0, 1, 2, 3)) << 16     # bit16-17 B 中央高地
+                | random.choice((0, 1, 2, 3, 4)) << 18  # bit18-20 R 前哨
+                | random.choice((0, 1, 2, 3, 4)) << 21  # bit21-23 B 前哨
             )
-            return struct.pack("<HHI", random.randint(0, 2000), 2000, flags)
+            terrain = (
+                random.randint(0, (1 << 22) - 1)        # bit0-21 地形跨越检测点（逐位 0/1）
+                | random.randint(0, 2) << 22            # bit22-23 R 前哨阵地控制
+                | random.randint(0, 2) << 24            # bit24-25 B 前哨阵地控制
+                | random.randint(0, 2) << 26            # bit26-27 R 基地阵地控制
+                | random.randint(0, 2) << 28            # bit28-29 B 基地阵地控制
+            )
+            return struct.pack("<HHII", random.randint(0, 2000), 2000, gauge, terrain)
         if cmd_id == CMD_ROBOT_BUFF:
-            # 5 台机器人 × 7B 增益（回血1+冷却2+防御1+负防御1+攻击2）+ 6B 尾部，共 41B
+            # 表 1-45：5 个 7B 增益槽（重装/保留/3步/4步/哨兵）+ 6B 状态 + 6B 加固圆，共 47B。
             buf = bytearray()
-            for _ in range(5):
+            for slot in range(5):
+                if slot == 1:  # 工程位保留，不能填随机增益
+                    buf += bytes(7)
+                    continue
                 buf += struct.pack("<BHBBH", random.randint(0, 100), random.randint(0, 50),
                                    random.randint(0, 100), random.randint(0, 100), random.randint(0, 100))
-            # 尾部 6B 是枚举而非自由数据：哨兵姿态 1~6，5 台机器人主要状态 0~3。
-            # 用随机字节会让 97% 的帧带上不存在的姿态值，接收端只要校验就整帧丢掉。
-            buf.append(random.randint(1, 6))                      # 哨兵当前姿态
-            buf += bytes(random.randint(0, 3) for _ in range(5))  # 英雄/工程/3步/4步/哨兵状态
+            # 状态区 6B 全是枚举：哨兵姿态 1~6，主要状态 0~3，第 2 项保留。
+            buf.append(random.randint(1, 6))                      # 35 哨兵当前姿态
+            buf.append(random.randint(0, 3))                      # 36 重装主要状态
+            buf.append(0)                                         # 37 保留位
+            buf += bytes(random.randint(0, 3) for _ in range(3))  # 38-40 3步/4步/哨兵状态
+            # 41-46 自定义装甲加固圆（x, y, r 单位 mm），半径 0 表示暂无加固情报。
+            # 多数帧保持 0，偶尔给出一个合法圆面用于接收端联调。
+            if random.random() < 0.3:
+                buf += struct.pack("<HHH", random.randint(0, 300), random.randint(0, 200),
+                                   random.randint(10, 80))
+            else:
+                buf += struct.pack("<HHH", 0, 0, 0)
             return bytes(buf)
         if cmd_id == CMD_INTERFERENCE_KEY:
             return self._random_key()
         raise ValueError(f"未知命令 {hex(cmd_id)}")
+
+    def _zero_reserved_position(self) -> None:
+        """表 1-41：第 2、5 组坐标（工程/空中位）为保留位，随机游走与初始化后都要清零。"""
+        for idx in (2, 3, 8, 9):
+            self._coords[idx] = 0
 
     def _random_key(self) -> bytes:
         """规则：6 位数字字母组合密钥。"""
@@ -372,7 +409,7 @@ class TxService:
         self._log(f"{wave} 发射已停止")
 
     def _build_info_stream(self, builder: SerialFrameBuilder) -> bytes:
-        """信息波周期流：140B，全部为 0x0A01~0x0A05 有效帧（规则 1400B/s @10Hz）。
+        """信息波周期流：150B，全部为 0x0A01~0x0A05 有效帧（各命令 10Hz）。
 
         关闭的命令位用等长随机字节占位：保持字节速率与官方一致，
         同时保留"关闭包位填随机字节"的接收压测能力。
@@ -697,6 +734,38 @@ class TxService:
                 "logs": list(self._logs),
             }
 
+    def _capacity_snapshot(self) -> dict:
+        """核算信息波业务字节能否塞进一个空口周期。
+
+        2027 协议把 0x0A04/0x0A05 加长后，5 条命令合计 150B/周期；空口包 27B
+        只装 15B 载荷，等效放大 1.8 倍。2027 规则手册尚未给出新的比特率/空口格式，
+        这里只做核算并把差距显式暴露，不改动射频参数。
+        """
+        mod = self.season.modulation
+        payload_bytes = self.season.info_bytes_per_cycle
+        air_bytes = payload_bytes * AIR_FRAME_LEN / AIR_PAYLOAD_LEN
+        air_bits = air_bytes * 8
+        air_seconds = air_bits / mod.bit_rate_hz
+        budget_s = 1.0 / self.season.cycles_per_sec
+        required_bps = air_bits / budget_s
+        ok = air_seconds <= budget_s + 1e-9
+        note = ""
+        if not ok:
+            note = (f"信息波 {payload_bytes}B/{budget_s * 1000:.0f}ms 需 {required_bps:.0f} bps，"
+                    f"当前码率 {mod.bit_rate_hz:.1f} bps（{air_seconds * 1000:.2f}ms/周期），"
+                    f"实际将以 {budget_s / air_seconds * 100:.1f}% 实时发送；"
+                    f"待 2027 规则手册确认空口/比特率参数")
+        return {
+            "payload_bytes": payload_bytes,
+            "air_bytes": round(air_bytes, 1),
+            "air_ms": round(air_seconds * 1000, 2),
+            "budget_ms": round(budget_s * 1000, 1),
+            "required_bps": round(required_bps),
+            "bit_rate_bps": round(mod.bit_rate_hz, 1),
+            "ok": ok,
+            "note": note,
+        }
+
     def _rules_snapshot(self) -> dict:
         """规则核对数据：表 5-23 全部波源参数 + 调制参数，供 Web 面板显示。"""
         mod = self.season.modulation
@@ -715,11 +784,12 @@ class TxService:
                     "sensitivity": round(2 * math.pi * p.freq_deviation_hz / mod.SAMPLE_RATE_HZ, 4),
                 })
         return {
-            "source": "规则手册 V2.2.0 表 5-23/附录 1 · 通信协议 V2.0.0",
+            "source": "雷达业务帧：通信协议 V1.0.0 §1.5 · 射频/空口：规则手册 V2.2.0 表 5-23/附录 1",
             "modulation": "2-GFSK · SPS=47 · BT=0.35 · 采样率 1MS/s · 无前导码/白化/FEC",
             "access_code_info": self.season.access_code_info.hex().upper(),
             "access_code_interfere": self.season.access_code_interfere.hex().upper(),
-            "info_rate": "1400 B/s · 0x0A01~0x0A05 全有效数据 · 各命令 10Hz",
+            "info_rate": "1500 B/s · 0x0A01~0x0A05 全有效数据 · 各命令 10Hz（150B/周期）",
             "jammer_rate": "1350 B/s · 0x0A06 10Hz + 随机填充",
+            "capacity": self._capacity_snapshot(),
             "profiles": profiles,
         }

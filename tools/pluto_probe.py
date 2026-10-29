@@ -168,9 +168,9 @@ def cmd_gfsk(args) -> None:
 
     def next_block() -> np.ndarray:
         if args.wave == "info":
-            stream = (builder.pack_position([500] * 12)
-                      + builder.pack_hp([300, 200, 150, 150, 0, 400])
-                      + builder.pack_buff(bytes(41)))
+            stream = (builder.pack_position([500, 0, 0, 0, 500, 0, 500, 0, 0, 0, 500, 0])
+                      + builder.pack_hp([300, 0, 150, 150, 0, 400])
+                      + builder.pack_buff(bytes(47)))
         else:
             # 干扰波规则速率 1350 B/s = 135 B/周期。密钥帧只有 15 B，只喂它会让
             # 切片器每 2~3 个周期才凑出 1 个空口包，占空比掉到真实值的 1/9，

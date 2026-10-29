@@ -20,8 +20,8 @@ SPB = AIR_FRAME_LEN * 8 * SEASON.modulation.SAMPLES_PER_SYMBOL  # 单个空口�
 DELAY = (len(gaussian_taps(SEASON.modulation)) - 1) // 2        # 高斯滤波器群延迟
 
 
-def _packets(n_bytes: int = 140):
-    """一个周期的空口包（140B → 9 个包，包内容各不相同）。"""
+def _packets(n_bytes: int = 150):
+    """一个周期的空口包（150B → 10 个包，包内容各不相同）。"""
     return AirStreamChunker(ACCESS_CODE_INFO).feed(bytes(range(n_bytes)))
 
 

@@ -20,8 +20,8 @@ from radar_tx.device.discovery import DiscoveredDevice, last_scan_note, scan_plu
 from radar_tx.device.pluto_tx import PlutoTx, _set_tx_gain, _tx_gain_attr
 from radar_tx.device.virtual_sdr import VirtualSdr
 from radar_tx.protocol.serial_frame import (
-    CMD_FIELD_STATUS, CMD_INTERFERENCE_KEY, CMD_ROBOT_BUFF, CMD_ROBOT_POSITION,
-    SerialFrameBuilder, SerialFrameDecoder,
+    CMD_FIELD_STATUS, CMD_INTERFERENCE_KEY, CMD_ROBOT_AMMO, CMD_ROBOT_BUFF,
+    CMD_ROBOT_HP, CMD_ROBOT_POSITION, SerialFrameBuilder, SerialFrameDecoder,
 )
 from radar_tx.scheduler.tx_service import TxService
 
@@ -68,31 +68,55 @@ def test_auto_vary_master_switch_and_manual_lock(service):
     assert sum(flags().values()) == len(flags()) - 1
 
 
-def test_info_stream_keeps_140_bytes_without_auto_vary(service):
+def test_info_stream_keeps_150_bytes_without_auto_vary(service):
     # 开启发射前就关掉自动变化时，命令从未生成过载荷；
-    # 若不补齐就会发出 data_length=0 的畸形帧，且周期字节数不再是 140
+    # 若不补齐就会发出 data_length=0 的畸形帧，且周期字节数不再是 150
     service.set_auto_vary(False)
     stream = service._build_info_stream(SerialFrameBuilder())
-    assert len(stream) == 140
+    assert len(stream) == 150
+
+
+def test_reserved_slots_are_zero(service):
+    # 2027 协议把工程/空中位置改为保留位：随机生成不得往保留槽里塞数据
+    pos = service._gen_payload(CMD_ROBOT_POSITION)
+    coords = struct.unpack("<12h", pos)
+    assert coords[2] == coords[3] == coords[8] == coords[9] == 0
+    hps = struct.unpack("<6H", service._gen_payload(CMD_ROBOT_HP))
+    assert hps[1] == 0 and hps[4] == 0
+    ammos = struct.unpack("<5H", service._gen_payload(CMD_ROBOT_AMMO))
+    assert ammos[3] == 0
+    assert service._gen_payload(CMD_ROBOT_BUFF)[7:14] == bytes(7)
 
 
 def test_buff_tail_fields_are_legal_enums(service):
-    # 表 1-48：尾部 6B 是枚举而不是自由数据——哨兵姿态 1~6、各机器人主要状态 0~3。
-    # 早先这里填 os.urandom(6)，约 97% 的帧会带上不存在的姿态值。
+    # 表 1-45：状态区 6B 是枚举而不是自由数据——哨兵姿态 1~6、各机器人主要状态 0~3、
+    # 第 2 项保留为 0；尾部 6B 为自定义装甲加固圆。
     for _ in range(200):
         payload = service._gen_payload(CMD_ROBOT_BUFF)
-        assert len(payload) == 41
+        assert len(payload) == 47
         assert 1 <= payload[35] <= 6, f"哨兵姿态越界：{payload[35]}"
-        assert all(0 <= v <= 3 for v in payload[36:]), f"状态枚举越界：{payload[36:].hex()}"
+        assert payload[37] == 0, "第 2 项保留位必须为 0"
+        assert all(0 <= v <= 3 for v in payload[36:41]), f"状态枚举越界：{payload[36:41].hex()}"
 
 
 def test_field_status_flags_respect_bitfield_ranges(service):
-    # 表 1-47：中央高地与前哨站都是 0/1/2 的三值枚举，随机取 0~7 会造出非法的 3
+    # 表 1-44：增益点是多值枚举，且"对方未控制"有独立编码（堡垒/基地/前哨 4、中央高地 3），
+    # 随机生成必须落在合法集合内；bit30-31 未定义，必须为 0。
     for _ in range(200):
-        flags = struct.unpack_from("<I", service._gen_payload(CMD_FIELD_STATUS), 4)[0]
-        assert (flags >> 1) & 0x3 <= 2, "中央高地占位值越界"
-        assert (flags >> 6) & 0x3 <= 2, "前哨站占位值越界"
-        assert flags >> 16 == 0, "表 1-47 只定义到 bit15"
+        payload = service._gen_payload(CMD_FIELD_STATUS)
+        assert len(payload) == 12
+        gauge, terrain = struct.unpack_from("<II", payload, 4)
+        assert (gauge >> 1) & 0x7 <= 4
+        assert (gauge >> 4) & 0x7 <= 4
+        assert (gauge >> 7) & 0x7 <= 4
+        assert (gauge >> 10) & 0x7 <= 4
+        assert (gauge >> 14) & 0x3 <= 3
+        assert (gauge >> 16) & 0x3 <= 3
+        assert (gauge >> 18) & 0x7 <= 4
+        assert (gauge >> 21) & 0x7 <= 4
+        assert terrain >> 30 == 0, "表 1-44 第二个状态字只定义到 bit29"
+        for shift in (22, 24, 26, 28):
+            assert (terrain >> shift) & 0x3 <= 2
 
 
 def test_short_key_pads_ui_and_wire_consistently(service):
